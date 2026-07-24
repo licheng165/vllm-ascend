@@ -437,6 +437,49 @@ class NPUWorker(WorkerBase):
                     scope="local",
                 )
 
+        # DSA top-k dump: reserve NPU aggregation buffer out of the KV budget.
+        if envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP:
+            _dump_cfg_tp_ranks = envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP_TP_RANKS
+            _tp_rank = 0
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                _tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                pass
+            _ranks_set: set[int] | None
+            if _dump_cfg_tp_ranks.strip().lower() == "all":
+                _ranks_set = None
+            else:
+                _ranks_set = {int(x) for x in _dump_cfg_tp_ranks.split(",") if x.strip()}
+            _dump_rank_hit = _ranks_set is None or _tp_rank in _ranks_set
+            if _dump_rank_hit:
+                from vllm_ascend.worker.dsa_topk_dumper import reserved_bytes as _dump_reserved_bytes
+
+                _hf = getattr(
+                    self.vllm_config.model_config, "hf_text_config", None
+                )
+                _num_layers = getattr(_hf, "num_hidden_layers", 0) if _hf else 0
+                _index_topk = int(
+                    getattr(_hf, "index_topk", envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP_EXPECTED_K)
+                    if _hf
+                    else envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP_EXPECTED_K
+                )
+                _num_spec = 0
+                if self.vllm_config.speculative_config:
+                    _num_spec = self.vllm_config.speculative_config.num_speculative_tokens
+                _max_req = envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP_MAX_REQUESTS
+                _dump_bytes = _dump_reserved_bytes(
+                    _num_layers, _max_req, 1 + _num_spec, _index_topk
+                )
+                if _dump_bytes:
+                    self.available_kv_cache_memory_bytes -= _dump_bytes
+                    logger.info_once(
+                        "Reserved %.2f GiB for DSA top-k dump buffer",
+                        GiB(_dump_bytes),
+                        scope="local",
+                    )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -745,6 +788,12 @@ class NPUWorker(WorkerBase):
         except Exception as e:
             logger.info(f"query NPU card {self.local_rank} fail: {e}")
         return
+
+    def shutdown(self) -> None:
+        _dumper = getattr(self.model_runner, "dsa_topk_dumper", None)
+        if _dumper is not None:
+            _dumper.close()
+        super().shutdown()
 
 
 def parse_text_output(output) -> None:

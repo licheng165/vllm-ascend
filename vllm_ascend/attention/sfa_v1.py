@@ -679,6 +679,7 @@ class AscendSFAMetadata:
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
+    decode_remap_boundary_cpu_rows: Any = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -2759,6 +2760,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+
+        # DSA top-k dump: capture raw positions before compact-scratch remap.
+        _dsa_topk_dumper = getattr(get_forward_context(), "dsa_topk_dumper", None)
+        if _dsa_topk_dumper is not None:
+            _dsa_topk_dumper.capture_layer(layer_name, topk_indices)
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)

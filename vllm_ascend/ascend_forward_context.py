@@ -103,6 +103,7 @@ def set_ascend_forward_context(
     dsa_req_ids=None,
     dsa_prompt_lens=None,
     dsa_adapter_cache=None,
+    dsa_topk_dumper=None,
     staged_sfa_graph_dummy_run: bool = False,
     staged_sfa_route: StagedSFARouteDecision | None = None,
     staged_sfa_graph_key: StagedSFAGraphKey | None = None,
@@ -134,6 +135,7 @@ def set_ascend_forward_context(
         forward_context.dsa_prompt_lens = dsa_prompt_lens
         # Adapter-backed latent hot cache (None unless VLLM_ASCEND_DSA_USE_ADAPTER_CACHE).
         forward_context.dsa_adapter_cache = dsa_adapter_cache
+        forward_context.dsa_topk_dumper = dsa_topk_dumper
         # True only for the explicit one-token eager warmup / graph-capture
         # passes used by the staged SFA proof of concept. Connector generators
         # and save hooks must not advance during either dummy pass.

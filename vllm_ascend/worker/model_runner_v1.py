@@ -359,6 +359,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
         self._dsa_short_prompt_warned = False
+        self.dsa_topk_dumper = None
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1493,15 +1494,31 @@ class NPUModelRunner(GPUModelRunner):
         # forward context whenever a DSA sparse path needs them: the offload manager
         # (Option A), the shrink-latent LMCache path (keys selected-token rows by
         # req_id), AND the adapter latent cache.
-        if dsa_offload_manager is not None or self.dsa_shrink_latent or dsa_adapter_cache is not None:
+        if dsa_offload_manager is not None or self.dsa_shrink_latent or dsa_adapter_cache is not None or self.dsa_topk_dumper is not None:
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
 
+        # DSA top-k dump: begin capture plan for this forward.
+        _dsa_topk_dump_active = False
+        if self.dsa_topk_dumper is not None:
+            _sfa_meta = None
+            if isinstance(attn_metadata, dict) and attn_metadata:
+                _sfa_meta = next(iter(attn_metadata.values()))
+            if _sfa_meta is not None:
+                self.dsa_topk_dumper.begin_forward(
+                    input_batch=self.input_batch,
+                    scheduler_output=scheduler_output,
+                    attn_metadata=_sfa_meta,
+                    positions_cpu=self.positions.np[:num_tokens_unpadded].copy(),
+                    query_start_loc_cpu=self.query_start_loc.np[:num_reqs + 1].copy(),
+                )
+                _dsa_topk_dump_active = True
+
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
-            record_function_or_nullcontext("forward"),
+            recordfunction_or_nullcontext("forward"),
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1517,6 +1534,7 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
+                dsa_topk_dumper=self.dsa_topk_dumper,
                 staged_sfa_route=staged_sfa_route,
                 staged_sfa_graph_key=staged_sfa_graph_key,
             ),
@@ -1527,15 +1545,22 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            if staged_sfa_graph_key is not None:
-                first_layer_name, first_impl = self._staged_sfa_impls[0]
-                first_impl.bootstrap_cross_layer(first_layer_name)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
-            if staged_sfa_graph_key is not None:
-                for _, impl in self._staged_sfa_impls:
-                    impl.submit_cross_layer_save()
+            try:
+                if staged_sfa_graph_key is not None:
+                    first_layer_name, first_impl = self._staged_sfa_impls[0]
+                    first_impl.bootstrap_cross_layer(first_layer_name)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+                if staged_sfa_graph_key is not None:
+                    for _, impl in self._staged_sfa_impls:
+                        impl.submit_cross_layer_save()
+            except Exception:
+                if _dsa_topk_dump_active and self.dsa_topk_dumper is not None:
+                    self.dsa_topk_dumper.abort_forward()
+                raise
+            if _dsa_topk_dump_active and self.dsa_topk_dumper is not None:
+                self.dsa_topk_dumper.finish_forward(input_batch=self.input_batch)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2396,7 +2421,7 @@ class NPUModelRunner(GPUModelRunner):
                 if staged_dummy_request_ids is not None
                 else (
                     self.input_batch.req_ids[:num_reqs]
-                    if self.dsa_shrink_latent
+                    if self.dsa_shrink_latent or self.dsa_topk_dumper is not None
                     else None
                 )
             ),
@@ -2484,7 +2509,7 @@ class NPUModelRunner(GPUModelRunner):
                 # metadata so the impl can read/write the indexer cache, which now
                 # has its own block ids.
                 cm.indexer_block_table_tensor, cm.indexer_slot_mapping = _get_block_table_and_slot_mapping(1)
-                if self.dsa_shrink_latent:
+                if self.dsa_shrink_latent or self.dsa_topk_dumper is not None:
                     # B2 compact-scratch decode: hand per-request prompt lengths
                     # (CPU) to the SFA builder, which expands them to per-ROW
                     # values (decode rows -> plen, prefill/padding rows -> 0 =
@@ -3500,6 +3525,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_transfer_group.register_kv_caches(kv_caches_to_register)
 
         self._maybe_init_dsa_latent_offload()
+        self._maybe_init_dsa_topk_dumper()
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -3561,6 +3587,107 @@ class NPUModelRunner(GPUModelRunner):
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
+
+    def _maybe_init_dsa_topk_dumper(self) -> None:
+        """Build the DSA top-k dump manager when enabled by env vars."""
+        import vllm_ascend.envs as envs_ascend
+
+        self.dsa_topk_dumper = None
+        if not envs_ascend.VLLM_ASCEND_DSA_TOPK_DUMP:
+            return
+
+        from vllm_ascend.worker.dsa_topk_dumper import DSATopKDumpConfig, DSATopKDumpManager
+
+        config = DSATopKDumpConfig.from_env()
+        config.validate()
+
+        tp_rank = 0
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            pass
+
+        if config.tp_ranks is not None and tp_rank not in config.tp_ranks:
+            logger.info(
+                "[DSA_TOPK_DUMP] TP rank %d not in dump ranks %s; skipping.",
+                tp_rank,
+                config.tp_ranks,
+            )
+            return
+
+        if not self.use_sparse:
+            raise RuntimeError(
+                "VLLM_ASCEND_DSA_TOPK_DUMP=1 requires a DSA/sparse model."
+            )
+
+        if envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH:
+            raise RuntimeError(
+                "VLLM_ASCEND_DSA_TOPK_DUMP=1 is incompatible with "
+                "VLLM_ASCEND_SFA_STAGED_GRAPH=1 in this version."
+            )
+
+        if config.include_mtp:
+            raise RuntimeError(
+                "VLLM_ASCEND_DSA_TOPK_DUMP_INCLUDE_MTP=1 is not supported; "
+                "MTP predictor token-ID schema is not implemented yet."
+            )
+
+        if self.use_async_scheduling:
+            raise RuntimeError(
+                "VLLM_ASCEND_DSA_TOPK_DUMP=1 is incompatible with async scheduling."
+            )
+
+        resolved_k = self.dsa_index_topk if self.dsa_index_topk > 0 else config.expected_k
+        if resolved_k != config.expected_k:
+            raise RuntimeError(
+                f"VLLM_ASCEND_DSA_TOPK_DUMP_EXPECTED_K={config.expected_k} "
+                f"but runtime index_topk={resolved_k}"
+            )
+
+        layer_names: list[str] = []
+        if self.attn_groups:
+            for gid in range(len(self.attn_groups)):
+                for aid in range(len(self.attn_groups[gid])):
+                    layer_names.extend(self.attn_groups[gid][aid].layer_names)
+        if not layer_names:
+            hf = getattr(self.model_config, "hf_text_config", None)
+            n = getattr(hf, "num_hidden_layers", 0) if hf else 0
+            layer_names = [
+                f"model.layers.{i}.self_attn.attn" for i in range(n)
+            ]
+
+        num_spec = 0
+        if self.speculative_config:
+            num_spec = self.speculative_config.num_speculative_tokens
+
+        model_info = {
+            "model": getattr(self.model_config, "served_name", ""),
+            "model_type": getattr(
+                getattr(self.model_config, "hf_config", None), "model_type", ""
+            ),
+            "num_hidden_layers": getattr(
+                getattr(self.model_config, "hf_text_config", None),
+                "num_hidden_layers",
+                len(layer_names),
+            ),
+        }
+
+        self.dsa_topk_dumper = DSATopKDumpManager(
+            config=config,
+            layer_names=layer_names,
+            index_topk=resolved_k,
+            device=self.device,
+            num_speculative_tokens=num_spec,
+            max_num_seqs=self.max_num_reqs,
+            model_info=model_info,
+        )
+        logger.info(
+            "[DSA_TOPK_DUMP] initialized for %d SFA layers, k=%d",
+            len(layer_names),
+            resolved_k,
+        )
 
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """

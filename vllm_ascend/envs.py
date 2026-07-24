@@ -195,6 +195,45 @@ env_variables: dict[str, Callable[[], Any]] = {
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.
     "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
+    # DSA indexer top-k dump for GLM5.1 diagnostics. Default OFF. When enabled,
+    # captures the raw (pre-remap) top-k positions from every target-model SFA
+    # layer during decode and writes JSONL records for offline head/tail analysis.
+    "VLLM_ASCEND_DSA_TOPK_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP", "0"))),
+    # Absolute output directory for dump JSONL files. Required when dump is enabled.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_DIR", ""),
+    # Deployment tag for the dump file name (e.g. "single_tp8", "decoder0_dp0_81").
+    "VLLM_ASCEND_DSA_TOPK_DUMP_TAG": lambda: os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_TAG", ""),
+    # Only record requests whose internal request ID contains this substring.
+    # Use a stable X-Request-Id header value to isolate one analysis request.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_REQUEST_ID_SUBSTR": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_TOPK_DUMP_REQUEST_ID_SUBSTR", ""
+    ),
+    # Max number of target-model decode forwards to record per request. Must be > 0.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_MAX_STEPS": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_MAX_STEPS", "128")
+    ),
+    # Max number of unique internal requests to capture per worker session. Also
+    # limits concurrent matched requests in one forward. Must be > 0.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_MAX_REQUESTS": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_MAX_REQUESTS", "1")
+    ),
+    # Which TP ranks to dump. "0" (default), comma-separated list, or "all".
+    "VLLM_ASCEND_DSA_TOPK_DUMP_TP_RANKS": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_TOPK_DUMP_TP_RANKS", "0"
+    ),
+    # Reserved: record MTP predictor layers. Only 0 is accepted in this version;
+    # setting 1 causes startup failure (predictor token-ID schema not implemented).
+    "VLLM_ASCEND_DSA_TOPK_DUMP_INCLUDE_MTP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_INCLUDE_MTP", "0"))
+    ),
+    # Expected index_topk value; startup fails if it differs from runtime.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_EXPECTED_K": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_EXPECTED_K", "2048")
+    ),
+    # Hard file size limit per worker in bytes. Default 2 GiB.
+    "VLLM_ASCEND_DSA_TOPK_DUMP_MAX_FILE_BYTES": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_TOPK_DUMP_MAX_FILE_BYTES", str(2 * 1024 * 1024 * 1024))
+    ),
 }
 
 # end-env-vars-definition
