@@ -2,6 +2,7 @@
 import json
 import os
 from dataclasses import dataclass
+from typing import Any
 
 import regex as re
 import torch
@@ -12,6 +13,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.distributed.kv_transfer.utils import mooncake_transfer_telemetry as mc_telemetry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
@@ -66,6 +68,17 @@ class MooncakeBackend(Backend):
             logger.error(msg)
             raise RuntimeError(msg)
 
+        self._mc_metrics_enabled = mc_telemetry.is_enabled()
+        self._mc_tp_rank: int | None = None
+        self._mc_dp_rank_global: int | None = getattr(parallel_config, "data_parallel_rank", None)
+        self._mc_dp_rank_local: int | None = getattr(parallel_config, "data_parallel_rank_local", None)
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            self._mc_tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            self._mc_tp_rank = None
+
     def set_device(self):
         device = torch.device(f"npu:{self.rank}")
         torch.npu.set_device(device)
@@ -74,26 +87,126 @@ class MooncakeBackend(Backend):
         if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
             global_te.register_buffer(ptrs, lengths)
 
+    def _mc_fabric_enabled(self) -> bool:
+        return os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
+
+    def _mc_store_common_kwargs(self) -> dict[str, Any]:
+        return dict(
+            configured_protocol=self.config.protocol,
+            fabric_mem_enabled=self._mc_fabric_enabled(),
+            tp_rank=self._mc_tp_rank,
+            dp_rank_global=self._mc_dp_rank_global,
+            dp_rank_local=self._mc_dp_rank_local,
+        )
+
     def exists(self, keys: list[str]) -> list[int]:
-        return self.store.batch_is_exist(keys)
+        enabled = self._mc_metrics_enabled
+        _start_wall = _start_perf = 0
+        if enabled:
+            _start_wall = mc_telemetry.now_wall_ns()
+            _start_perf = mc_telemetry.now_perf_ns()
+        result: list[int] | None = None
+        _exc_type: str | None = None
+        try:
+            result = self.store.batch_is_exist(keys)
+        except Exception as e:
+            _exc_type = type(e).__name__
+            raise
+        finally:
+            if enabled:
+                try:
+                    _end_perf = mc_telemetry.now_perf_ns()
+                    _end_wall = mc_telemetry.now_wall_ns()
+                    payload = mc_telemetry.build_store_exists_metric_payload(
+                        start_perf_ns=_start_perf,
+                        end_perf_ns=_end_perf,
+                        start_wall_time_ns=_start_wall,
+                        end_wall_time_ns=_end_wall,
+                        keys=keys,
+                        result=result if _exc_type is None else None,
+                        exception_type=_exc_type,
+                        **self._mc_store_common_kwargs(),
+                    )
+                    mc_telemetry.emit_mooncake_transfer_metric(payload)
+                except Exception:
+                    logger.debug("Failed to build Mooncake EXISTS metric", exc_info=True)
+        return result  # type: ignore[return-value]
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        enabled = self._mc_metrics_enabled
+        _start_wall = _start_perf = 0
+        input_summary = None
+        if enabled:
+            input_summary = mc_telemetry.safe_summarize_store_input(keys, addrs, sizes)
+            _start_wall = mc_telemetry.now_wall_ns()
+            _start_perf = mc_telemetry.now_perf_ns()
+        result: list[int] | None = None
+        _exc_type: str | None = None
         try:
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
+            result = list(res) if res is not None else None
             for value in res:
                 if value < 0:
                     logger.error(f"Failed to put key {keys},res:{res}")
         except Exception as e:
+            _exc_type = type(e).__name__
             logger.error(f"Failed to put key {keys},error:{e}")
+        finally:
+            if enabled:
+                try:
+                    _end_perf = mc_telemetry.now_perf_ns()
+                    _end_wall = mc_telemetry.now_wall_ns()
+                    payload = mc_telemetry.build_store_put_metric_payload(
+                        start_perf_ns=_start_perf,
+                        end_perf_ns=_end_perf,
+                        start_wall_time_ns=_start_wall,
+                        end_wall_time_ns=_end_wall,
+                        input_summary=input_summary,
+                        result=result,
+                        exception_type=_exc_type,
+                        **self._mc_store_common_kwargs(),
+                    )
+                    mc_telemetry.emit_mooncake_transfer_metric(payload)
+                except Exception:
+                    logger.debug("Failed to build Mooncake PUT metric", exc_info=True)
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        enabled = self._mc_metrics_enabled
+        _start_wall = _start_perf = 0
+        input_summary = None
+        if enabled:
+            input_summary = mc_telemetry.safe_summarize_store_input(keys, addrs, sizes)
+            _start_wall = mc_telemetry.now_wall_ns()
+            _start_perf = mc_telemetry.now_perf_ns()
+        result: list[int] | None = None
+        _exc_type: str | None = None
         try:
             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            result = list(res) if res is not None else None
             for value in res:
                 if value < 0:
                     logger.error(f"Failed to get key {keys}, res:{res}")
         except Exception as e:
+            _exc_type = type(e).__name__
             logger.error(f"Failed to get key {keys}, error:{e}")
+        finally:
+            if enabled:
+                try:
+                    _end_perf = mc_telemetry.now_perf_ns()
+                    _end_wall = mc_telemetry.now_wall_ns()
+                    payload = mc_telemetry.build_store_get_metric_payload(
+                        start_perf_ns=_start_perf,
+                        end_perf_ns=_end_perf,
+                        start_wall_time_ns=_start_wall,
+                        end_wall_time_ns=_end_wall,
+                        input_summary=input_summary,
+                        result=result,
+                        exception_type=_exc_type,
+                        **self._mc_store_common_kwargs(),
+                    )
+                    mc_telemetry.emit_mooncake_transfer_metric(payload)
+                except Exception:
+                    logger.debug("Failed to build Mooncake GET metric", exc_info=True)
 
 
 @dataclass

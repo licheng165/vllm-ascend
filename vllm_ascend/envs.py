@@ -107,6 +107,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Whether to emit structured Mooncake transfer metric events
+    # (latency/bytes/IOPS) for P2P KV transfer and Mooncake Store operations.
+    # Valid values: 0 (disabled, default) or 1 (enabled).
+    # Non-zero non-integer values raise on read following the same rule as
+    # other boolean envs above. Not sensitive.
+    "VLLM_ASCEND_MOONCAKE_TRANSFER_METRICS": lambda: bool(int(os.getenv("VLLM_ASCEND_MOONCAKE_TRANSFER_METRICS", "0"))),
 }
 
 # end-env-vars-definition

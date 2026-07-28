@@ -48,6 +48,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.distributed.kv_transfer.utils import mooncake_transfer_telemetry as mc_telemetry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
 from vllm_ascend.utils import enable_custom_op, is_vl_model
@@ -315,6 +316,10 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_caches: dict[str, Any],
         prefill_pp_layer_partition: str | None = None,
+        dp_rank_global: int | None = None,
+        dp_rank_local: int | None = None,
+        kv_role: str | None = None,
+        local_memory_type: str = "",
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -368,6 +373,15 @@ class KVCacheRecvingThread(threading.Thread):
                 self.v_head_dim = self.model_config.hf_text_config.head_dim
                 self.num_kv_heads = max(self.model_config.hf_text_config.num_key_value_heads // self.tp_size, 1)
         self.proc_not_transfer_request: dict[str, bool] = {}
+
+        # Mooncake transfer telemetry. The switch is cached once so the
+        # disabled path performs no clock reads or JSON on the hot path.
+        self._mc_metrics_enabled = mc_telemetry.is_enabled()
+        self._dp_rank_global = dp_rank_global
+        self._dp_rank_local = dp_rank_local
+        self._kv_role = kv_role
+        self._local_memory_type = local_memory_type
+        self._local_host = get_ip()
 
     def add_request(
         self,
@@ -543,10 +557,47 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_list.append(dst)
                 length_list.append(length)
 
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
-        if ret < 0:
-            logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
-            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+        mc_enabled = self._mc_metrics_enabled
+        request_id = req_meta.get("request_id")
+        _mc_start_wall = _mc_start_perf = 0
+        if mc_enabled:
+            _mc_start_wall = mc_telemetry.now_wall_ns()
+            _mc_start_perf = mc_telemetry.now_perf_ns()
+        ret = None
+        _mc_exception_type: str | None = None
+        try:
+            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            if ret < 0:
+                logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
+                raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+        except Exception as exc:
+            _mc_exception_type = type(exc).__name__
+            raise
+        finally:
+            if mc_enabled:
+                _mc_end_perf = mc_telemetry.now_perf_ns()
+                _mc_end_wall = mc_telemetry.now_wall_ns()
+                try:
+                    self._emit_p2p_read_metric(
+                        start_perf_ns=_mc_start_perf,
+                        end_perf_ns=_mc_end_perf,
+                        start_wall_time_ns=_mc_start_wall,
+                        end_wall_time_ns=_mc_end_wall,
+                        length_list=length_list,
+                        ret=ret,
+                        exception_type=_mc_exception_type,
+                        request_id=request_id,
+                        remote_request_id=remote_request_id,
+                        remote_engine_id=remote_engine_id,
+                        remote_host=remote_host,
+                        session_id=session_id,
+                        num_blocks=num_blocks,
+                        num_transfer_groups=num_transfer_groups,
+                        global_offset=global_offset,
+                        tp_num_need_pulls=tp_num_need_pulls,
+                    )
+                except Exception:
+                    logger.debug("Failed to build Mooncake P2P metric", exc_info=True)
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -665,6 +716,73 @@ class KVCacheRecvingThread(threading.Thread):
                 self._nz_kv_cache(k_cache_layer, v_cache_layer, k_buffer, v_buffer, slot_mapping)
         # Clean up buffers
         del k_buffer, v_buffer
+
+    def _emit_p2p_read_metric(
+        self,
+        *,
+        start_perf_ns: int,
+        end_perf_ns: int,
+        start_wall_time_ns: int,
+        end_wall_time_ns: int,
+        length_list: list[int],
+        ret: int | None,
+        exception_type: str | None,
+        request_id: str | None,
+        remote_request_id: str,
+        remote_engine_id: str,
+        remote_host: str,
+        session_id: str,
+        num_blocks: int,
+        num_transfer_groups: int,
+        global_offset: int,
+        tp_num_need_pulls: int,
+    ) -> None:
+        attempted_bytes = sum(length_list)
+        attempted_items = len(length_list)
+        if exception_type is None and ret is not None and ret >= 0:
+            outcome = "success"
+            completed_bytes: int | None = attempted_bytes
+            completed_items: int | None = attempted_items
+            return_code: int | None = ret
+        else:
+            outcome = "error"
+            completed_bytes = None
+            completed_items = None
+            return_code = ret if ret is not None else None
+        local_memory_type = self._local_memory_type or "unknown"
+        network_type, network_type_source = mc_telemetry.classify_p2p_network_type(local_memory_type)
+        same_host = self._local_host == remote_host
+        payload = mc_telemetry.build_p2p_read_metric_payload(
+            start_perf_ns=start_perf_ns,
+            end_perf_ns=end_perf_ns,
+            start_wall_time_ns=start_wall_time_ns,
+            end_wall_time_ns=end_wall_time_ns,
+            attempted_bytes=attempted_bytes,
+            completed_bytes=completed_bytes,
+            attempted_items=attempted_items,
+            completed_items=completed_items,
+            outcome=outcome,
+            return_code=return_code,
+            exception_type=exception_type,
+            request_id=request_id,
+            remote_request_id=remote_request_id,
+            local_engine_id=self.local_engine_id,
+            peer_engine_id=remote_engine_id,
+            remote_host=remote_host,
+            session_id=session_id,
+            same_host=same_host,
+            num_blocks=num_blocks,
+            num_groups=num_transfer_groups,
+            tp_rank=self.tp_rank,
+            dp_rank_global=self._dp_rank_global,
+            dp_rank_local=self._dp_rank_local,
+            kv_role=self._kv_role,
+            pull_offset=global_offset,
+            local_memory_type=local_memory_type,
+            network_type=network_type,
+            network_type_source=network_type_source,
+        )
+        mc_telemetry.emit_mooncake_transfer_metric(payload)
 
     def _cat_kv_cache(
         self, k_cache_layer, v_cache_layer, k_buffer, v_buffer, tp_num_need_pulls, num_blocks, num_tokens, slot_mapping
@@ -946,6 +1064,14 @@ class MooncakeConnectorScheduler:
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
 
+        # Mooncake transfer telemetry. Cached once at init so the disabled
+        # path performs no clock reads or JSON on the hot path.
+        self._mc_metrics_enabled = mc_telemetry.is_enabled()
+        self._dp_rank_global = vllm_config.parallel_config.data_parallel_rank
+        self._dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
+        self._tp_rank = vllm_config.parallel_config.tensor_parallel_size - 1
+        self._kv_role = vllm_config.kv_transfer_config.kv_role
+
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
         For remote prefill, pull all prompt blocks from remote
@@ -1059,6 +1185,23 @@ class MooncakeConnectorScheduler:
             self._reqs_need_send[request.request_id] = time.time()
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+
+        if self._mc_metrics_enabled:
+            try:
+                end_wall = mc_telemetry.now_wall_ns()
+                payload = mc_telemetry.build_publish_ready_payload(
+                    end_wall_time_ns=end_wall,
+                    remote_request_id=request.request_id,
+                    local_engine_id=self.engine_id,
+                    num_blocks=num_prompt_blocks,
+                    kv_role=self._kv_role,
+                    tp_rank=self._tp_rank,
+                    dp_rank_global=self._dp_rank_global,
+                    dp_rank_local=self._dp_rank_local,
+                )
+                mc_telemetry.emit_mooncake_transfer_metric(payload)
+            except Exception:
+                logger.debug("Failed to build Mooncake publish_ready metric", exc_info=True)
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -1223,6 +1366,7 @@ class MooncakeConnectorWorker:
         ptrs = []
         lengths = []
         length = len(self.block_len)
+        local_memory_type = ""
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
             for i, cache in enumerate(cache_or_caches, 0):
@@ -1231,7 +1375,10 @@ class MooncakeConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
+                if not local_memory_type and hasattr(cache, "device"):
+                    local_memory_type = str(cache.device.type)
         global_te.register_buffer(ptrs, lengths)
+        self._local_memory_type = local_memory_type
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
@@ -1272,6 +1419,10 @@ class MooncakeConnectorWorker:
                 self.vllm_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
+                dp_rank_global=self.vllm_config.parallel_config.data_parallel_rank,
+                dp_rank_local=self.dp_rank,
+                kv_role=self.kv_role,
+                local_memory_type=self._local_memory_type,
             )
             self.kv_recv_thread.start()
 
