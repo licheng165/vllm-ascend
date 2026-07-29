@@ -152,6 +152,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Request-level context-length threshold for DSA threshold routing
+    # (03_GLM51_DSA提示词阈值分流详细设计). The routing decision uses the
+    # *accepted* context length (prompt + accepted output tokens), NOT a fixed
+    # initial prompt_len, so the variable is named CONTEXT_LENGTH.
+    #   unset / 0        -> threshold state machine disabled (LEGACY route;
+    #                       RequestKey/quorum/failure-cleanup safety still on)
+    #   positive int N   -> accepted_context_len >= N enters PROMOTING
+    #   N > max_model_len-> all legal requests stay resident (warning at start)
+    #   negative/non-int -> startup failure
+    # Recommended initial value: 8192. Validated/parsed by the Ascend platform
+    # config (see vllm_ascend.platform.NPUPlatform.check_and_update_config) which
+    # writes the normalized config into VllmConfig.additional_config['dsa'].
+    "VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD", "0"
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.

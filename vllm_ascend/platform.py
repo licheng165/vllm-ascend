@@ -262,6 +262,15 @@ class NPUPlatform(Platform):
 
         ascend_config = init_ascend_config(vllm_config)
 
+        # Parse and validate the DSA context-length threshold routing env var
+        # (03_GLM51_DSA提示词阈值分流详细设计 section 5).  This is the single
+        # authoritative parser; the normalized config is written into
+        # additional_config['dsa'] and consumed by the vLLM Scheduler's
+        # DSAController.  Performs fail-fast prerequisite validation including
+        # the async-scheduling + shrink-latent guard.
+        from vllm_ascend.dsa_threshold_config import apply_dsa_threshold_config
+        apply_dsa_threshold_config(vllm_config)
+
         if vllm_config.kv_transfer_config is not None:
             check_kv_extra_config(vllm_config)
             if not getattr(vllm_config.kv_transfer_config, "_engine_id_patched", False):

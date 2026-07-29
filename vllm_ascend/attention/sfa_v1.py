@@ -254,6 +254,8 @@ def _update_dsa_split_boundary_in_place(
     attn_metadata: Any,
     cached_tokens: list[int] | None,
     decode_window_size: int,
+    *,
+    index_topk: int = 0,
 ) -> torch.Tensor:
     """Update the builder-owned row boundary without temporary device tensors."""
     split_boundary = attn_metadata.split_boundary
@@ -358,8 +360,51 @@ def _update_dsa_split_boundary_in_place(
             row_req_indices[valid_rows]
         ]
 
+    # DSA threshold routing: apply per-request route override (design 11.1).
+    # ``dsa_route_table`` (when present) maps request_index ->
+    # (route_state_str, remap_end).  LEGACY keeps the legacy boundary; SPARSE
+    # uses route.remap_end; every other state (RESIDENT/PROMOTING/RECOVERING/
+    # FALLBACK_RESIDENT) forces boundary=0 so resident rows keep absolute
+    # indices and no sparse remap is generated.
+    dsa_route_table = getattr(attn_metadata, "dsa_route_table", None)
+    if dsa_route_table:
+        for row_idx in range(num_rows):
+            req_idx = int(row_req_indices[row_idx])
+            if req_idx < 0:
+                continue
+            entry = dsa_route_table.get(req_idx)
+            if entry is None:
+                continue
+            route_state, remap_end = entry
+            if route_state == "sparse":
+                boundary_cpu[row_idx] = int(remap_end or 0)
+            elif route_state == "legacy":
+                # keep the legacy-computed boundary above
+                pass
+            else:
+                boundary_cpu[row_idx] = 0
+
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
+
+    # Native path scratch validation (design 11.1): the staged path already
+    # calls _validate_dsa_scratch_capacity; the native path must perform the
+    # same fail-closed validation before kernel binding so an invalid boundary
+    # (0 < b < scratch_capacity) cannot reach the kernel.
+    scratch_base_rows = getattr(attn_metadata, "decode_scratch_base_cpu", None)
+    scratch_capacity = getattr(attn_metadata, "decode_scratch_capacity", None)
+    if (
+        scratch_base_rows is not None
+        and scratch_capacity is not None
+        and getattr(attn_metadata, "num_decode_tokens", 0) > 0
+    ):
+        _validate_dsa_scratch_capacity(
+            boundary_rows=boundary_cpu[:num_rows],
+            row_req_indices=row_req_indices,
+            scratch_base_rows=scratch_base_rows,
+            index_topk=index_topk,
+            scratch_capacity=scratch_capacity,
+        )
     return split_boundary
 
 
@@ -3483,6 +3528,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         attn_metadata,
                         _lmcache_cached_tokens,
                         _decode_window_size,
+                        index_topk=int(getattr(self, "index_topk", 0) or 0),
                     )
                     if _decode_window_size > 0 and _mtp_dw_diag_enabled():
                         # Diagnostics only; these host values are intentionally

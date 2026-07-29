@@ -510,6 +510,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
+        # Per-request DSA route table refreshed each step from the Scheduler's
+        # dsa_routes snapshots (design 11.1).  None when routing is disabled.
+        self._dsa_route_table: dict[int, tuple[str, int]] | None = None
         # dsa c8
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
@@ -1500,6 +1503,16 @@ class NPUModelRunner(GPUModelRunner):
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
+                )
+
+                # Build the per-request DSA route table (request_index ->
+                # (route_state, remap_end)) from the Scheduler's authoritative
+                # dsa_routes snapshots.  The SFA consumes this to set per-row
+                # boundary (design 11.1): SPARSE -> remap_end, RESIDENT/
+                # PROMOTING/other -> 0, LEGACY -> legacy boundary.  None keeps
+                # the existing prompt-phase behavior.
+                self._dsa_route_table = self._build_dsa_route_table(
+                    scheduler_output, num_reqs
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -2866,6 +2879,9 @@ class NPUModelRunner(GPUModelRunner):
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
                     cm.prompt_lens_cpu = plens_np
+                    # Per-request DSA route table consumed by the SFA boundary
+                    # override (design 11.1).  None preserves legacy behavior.
+                    cm.dsa_route_table = getattr(self, "_dsa_route_table", None)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -2967,6 +2983,36 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return None
         return batch_size
+
+    def _build_dsa_route_table(
+        self,
+        scheduler_output: Any,
+        num_reqs: int,
+    ) -> dict[int, tuple[str, int]] | None:
+        """Build request_index -> (route_state, remap_end) from dsa_routes.
+
+        Returns None when the Scheduler did not publish route snapshots (DSA
+        threshold routing disabled), so the SFA keeps its existing prompt-phase
+        boundary behavior.
+        """
+        dsa_routes = getattr(scheduler_output, "dsa_routes", None)
+        if not dsa_routes:
+            return None
+        req_id_to_index = self.input_batch.req_id_to_index
+        table: dict[int, tuple[str, int]] = {}
+        for req_id, snapshot in dsa_routes.items():
+            idx = req_id_to_index.get(req_id)
+            if idx is None or idx >= num_reqs:
+                continue
+            route_state = getattr(snapshot, "route_state", None)
+            route_state_str = (
+                getattr(route_state, "value", str(route_state))
+                if route_state is not None
+                else "legacy"
+            )
+            remap_end = int(getattr(snapshot, "remap_end", 0) or 0)
+            table[int(idx)] = (route_state_str, remap_end)
+        return table or None
 
     def _staged_sfa_local_route(
         self,
