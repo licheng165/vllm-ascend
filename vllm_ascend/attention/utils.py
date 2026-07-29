@@ -24,6 +24,13 @@ _DSA_LMCACHE_TRACE = envs.VLLM_ASCEND_DSA_LMCACHE_TRACE
 
 
 def _dsa_lmcache_log_layer(layer_name: str) -> bool:
+    # Legacy per-layer [DSA_INDEX_LMCACHE] emitters are disabled once the
+    # unified dsa_offload.v1 protocol is active (see §4 of the DSA log
+    # enhancement design). Those per-layer logs carried tensor summaries that
+    # can force NPU->CPU synchronization on the decode hot path.
+    from vllm.observability.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return _DSA_LMCACHE_TRACE and "layers.0." in layer_name
 
 

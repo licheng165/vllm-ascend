@@ -107,7 +107,22 @@ _lmcache_sparse_wait_sync_once_lock = Lock()
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from vllm.observability.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return envs.VLLM_ASCEND_MTP_DW_DIAG
+
+
+# Structured dsa_offload.v1 emitter for the Ascend SFA (§7.3). No-op until the
+# unified level is set; legacy [MTP_DW] emitters above are disabled in that case.
+from vllm.observability.dsa_offload import (
+    DiagLevel as _DSADiagLevel,
+    dsa_logger_for as _dsa_logger_for,
+)
+
+_dsa_log = _dsa_logger_for("ascend.sfa")
 
 
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
@@ -3436,6 +3451,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+            # Deep-only indexer probe (§6.3/§7.3): report only the top-k shape,
+            # never its values. Deep is restricted to a single trace/rank and is
+            # explicitly marked as perturbing performance.
+            if _dsa_log.enabled(_DSADiagLevel.DEEP):
+                _dsa_log.emit(
+                    "index.select",
+                    outcome="ok",
+                    level=_DSADiagLevel.DEEP,
+                    topk_shape=list(topk_indices.shape)
+                    if hasattr(topk_indices, "shape") else None,
+                    topk_dtype=str(getattr(topk_indices, "dtype", "")) or None,
+                    query_width=int(q_c.shape[-2])
+                    if hasattr(q_c, "shape") else None,
+                )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)

@@ -218,6 +218,37 @@ env_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
         and int(os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"))
     ),
+    # ---- Unified DSA offload structured diagnostics (dsa_offload.v1) ----
+    # Replaces the ad-hoc [MTP_DW]/[DSA_INDEX_LMCACHE] emitters with a single
+    # switchable, lazily-evaluated, single-line JSON protocol. See
+    # `02_GLM51_DSA特性流程日志增强详细设计.md` §4. off by default; selecting a
+    # non-off level atomically disables the legacy emitters (handled at each
+    # emitter call site). When unset, the legacy VLLM_ASCEND_MTP_DW_DIAG /
+    # VLLM_ASCEND_MTP_DW_DEEP_DIAG flags map onto sampled/deep for one version
+    # cycle (new code MUST use the unified variable only).
+    "VLLM_ASCEND_DSA_DIAG_LEVEL": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_DIAG_LEVEL", "off"
+    ).strip().lower() or "off",
+    # Decode step cadence for sampled summaries per request scope.
+    "VLLM_ASCEND_DSA_DIAG_SAMPLE_EVERY": lambda: max(
+        int(os.getenv("VLLM_ASCEND_DSA_DIAG_SAMPLE_EVERY", "128")), 1
+    ),
+    # Restrict sampled/deep output to a single trace id (display only).
+    "VLLM_ASCEND_DSA_DIAG_TRACE_ID": lambda: (
+        os.getenv("VLLM_ASCEND_DSA_DIAG_TRACE_ID", "").strip() or None
+    ),
+    # Logical node tag for cross-host correlation (e.g. prefiller0/decoder1).
+    "VLLM_ASCEND_DSA_DIAG_NODE_TAG": lambda: (
+        os.getenv("VLLM_ASCEND_DSA_DIAG_NODE_TAG", "").strip() or None
+    ),
+    # >0 periodically emits an aggregate snapshot without a request id.
+    "VLLM_ASCEND_DSA_STATS_INTERVAL_SECONDS": lambda: max(
+        float(os.getenv("VLLM_ASCEND_DSA_STATS_INTERVAL_SECONDS", "0")), 0.0
+    ),
+    # Whether to also emit the raw internal request id (default off for privacy).
+    "VLLM_ASCEND_DSA_DIAG_INCLUDE_REQUEST_ID": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_DIAG_INCLUDE_REQUEST_ID", "0"))
+    ),
     # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.

@@ -192,6 +192,11 @@ def _staged_sfa_dummy_remap_boundaries(
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from vllm.observability.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
 
 
@@ -210,6 +215,17 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     payload = {"schema": 1, "stage": stage, "owner": "vllm_ascend_runner"}
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+# Structured dsa_offload.v1 emitter for the Ascend ModelRunner (§7.3). No-op
+# until VLLM_ASCEND_DSA_DIAG_LEVEL is set; the legacy [MTP_DW] emitters above are
+# disabled in that case.
+from vllm.observability.dsa_offload import (
+    DiagLevel as _DSADiagLevel,
+    dsa_logger_for as _dsa_logger_for,
+)
+
+_dsa_log = _dsa_logger_for("ascend.runner")
 
 
 def _mtp_dw_for_requests(
@@ -1754,6 +1770,22 @@ class NPUModelRunner(GPUModelRunner):
                 req_ids=diag_req_ids,
                 deferred=not clear_kv_metadata,
                 order=0,
+            )
+        # Structured forward.plan (§6.3/§7.3): one sampled summary per schedule
+        # step, aggregated AFTER all attention metadata is built. Cheap fields
+        # only; accepted token counts belong to the Scheduler's decode.step.
+        if _dsa_log.enabled(_DSADiagLevel.SAMPLED):
+            scheduled = scheduler_output.num_scheduled_tokens or {}
+            _dsa_log.emit(
+                "forward.plan",
+                outcome="ok",
+                level=_DSADiagLevel.SAMPLED,
+                schedule_id=getattr(scheduler_output, "schedule_id", 0),
+                request_count=len(scheduled),
+                decode_rows=sum(
+                    v for v in scheduled.values() if v
+                ),
+                mtp_enabled=self.speculative_config is not None,
             )
         with (
             record_function_or_nullcontext("forward"),
