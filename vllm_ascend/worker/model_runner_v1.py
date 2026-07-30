@@ -3024,6 +3024,7 @@ class NPUModelRunner(GPUModelRunner):
         if metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            StagedSFARouteReason.MIXED_DSA_ROUTE,
         ):
             return native(metadata_reason)
         if metadata_reason != StagedSFARouteReason.ELIGIBLE:

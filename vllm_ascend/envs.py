@@ -152,6 +152,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Compress the DSA sparse selective-load payload to OFFLOADED requests only
+    # (design 14.3). When enabled, a compact block table (gather of offloaded
+    # native rows) and compact row indices are passed to prepare_sparse_indices
+    # so RESIDENT/PROMOTING rows are skipped and never occupy an LMCache payload
+    # row. Defaults to 0 (off): the native-order path (compact_idx == native_idx
+    # with resident rows at count 0) is the validated default. Enable only after
+    # NPU kernel validation of the compact views.
+    "VLLM_ASCEND_DSA_COMPACT_PAYLOAD": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_COMPACT_PAYLOAD", "0"))
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.

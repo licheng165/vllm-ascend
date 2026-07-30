@@ -110,6 +110,10 @@ class StagedSFARouteReason(str, Enum):
     INVALID_REQUEST_IDS = "invalid_request_ids"
     DENSE_PREFIX_HIT = "dense_prefix_hit"
     MIXED_CONNECTOR_LOAD = "mixed_connector_load"
+    # Per-request DSA route is mixed (some resident/promoting, some offloaded)
+    # or fully resident: the staged graph requires a uniform offloaded route,
+    # so the batch falls back to native per-row remap (design 14.4).
+    MIXED_DSA_ROUTE = "mixed_dsa_route"
     MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
     SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
     FRONTIER_TOO_SHORT = "frontier_too_short"

@@ -336,6 +336,229 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Per-request DSA offload routing (RESIDENT / PROMOTING / OFFLOADED).
+#
+# LMCache is the single source of truth and publishes a route table on
+# LMCacheConnectorMetadata.dsa_offload_routes each step. vLLM-Ascend consumes
+# that table here to decide per-row resident vs offloaded behavior; it never
+# re-derives the offload threshold. See design sections 11.4 and 15.2.
+# ---------------------------------------------------------------------------
+DSA_ROUTE_STATE_RESIDENT = "resident"
+DSA_ROUTE_STATE_PROMOTING = "promoting"
+DSA_ROUTE_STATE_OFFLOADED = "offloaded"
+
+
+@dataclass(frozen=True)
+class DSARouteSnapshot:
+    """Per-request DSA route snapshot read from the connector route table."""
+
+    state: str
+    committed_end: int
+    generation: int
+    window_anchor: int
+
+    @property
+    def is_offloaded(self) -> bool:
+        return self.state == DSA_ROUTE_STATE_OFFLOADED
+
+    @property
+    def is_resident_path(self) -> bool:
+        # RESIDENT and PROMOTING requests keep a fully resident latent forward:
+        # no scratch remap, no selective load, absolute top-k positions.
+        return self.state in (DSA_ROUTE_STATE_RESIDENT, DSA_ROUTE_STATE_PROMOTING)
+
+
+# Default snapshot for requests absent from the route table: safe-resident,
+# zero frontier. This lets mixed batches carry resident rows without raising.
+DSA_RESIDENT_ROUTE_SNAPSHOT = DSARouteSnapshot(
+    state=DSA_ROUTE_STATE_RESIDENT,
+    committed_end=0,
+    generation=0,
+    window_anchor=0,
+)
+
+
+def _get_dsa_offload_routes_table() -> Any:
+    """Return the published dsa_offload_routes map, or None if unavailable."""
+    if not staged_sfa_connector_supports_sparse_load():
+        return None
+    connector = get_kv_transfer_group()
+    get_metadata = getattr(connector, "_get_connector_metadata", None)
+    if not callable(get_metadata):
+        return None
+    try:
+        metadata = get_metadata()
+    except Exception:
+        return None
+    routes = getattr(metadata, "dsa_offload_routes", None)
+    if not routes:
+        return None
+    return routes
+
+
+def get_dsa_offload_routes(request_ids: Any) -> list[DSARouteSnapshot] | None:
+    """Read the per-request DSA route table in active-request order.
+
+    Args:
+        request_ids: active request IDs in native batch order.
+
+    Returns:
+        A list of :class:`DSARouteSnapshot` aligned to ``request_ids``, or
+        ``None`` when no route table is published (legacy / no-DSA-offload
+        path). Requests missing from the table get a RESIDENT snapshot with a
+        zero frontier, so mixed resident/offloaded batches carry resident rows
+        without raising.
+    """
+    if request_ids is None:
+        return None
+    normalized = [str(req_id) for req_id in request_ids]
+    if not normalized:
+        return None
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError(
+            "[SFA route] unique native request IDs required for route lookup."
+        )
+    routes = _get_dsa_offload_routes_table()
+    if routes is None:
+        return None
+    snapshots: list[DSARouteSnapshot] = []
+    for req_id in normalized:
+        route = routes.get(req_id)
+        if route is None:
+            snapshots.append(DSA_RESIDENT_ROUTE_SNAPSHOT)
+            continue
+        snapshots.append(
+            DSARouteSnapshot(
+                state=str(getattr(route, "state", DSA_ROUTE_STATE_RESIDENT)),
+                committed_end=int(getattr(route, "committed_end", 0)),
+                generation=int(getattr(route, "generation", 0)),
+                window_anchor=int(getattr(route, "window_anchor", 0)),
+            )
+        )
+    return snapshots
+
+
+def dsa_route_frontier(snapshots: list[DSARouteSnapshot] | None) -> list[int]:
+    """Return the per-request remap frontier derived from route snapshots.
+
+    Only OFFLOADED rows with a positive committed frontier contribute a remap
+    boundary; RESIDENT/PROMOTING rows contribute 0 (absolute top-k, no remap).
+    Returns an empty list when no route table is published.
+    """
+    if not snapshots:
+        return []
+    return [
+        int(s.committed_end) if s.is_offloaded and s.committed_end > 0 else 0
+        for s in snapshots
+    ]
+
+
+def get_dsa_window_anchors(request_ids: Any) -> list[int] | None:
+    """Return the per-request decode-window anchor Q in active-request order.
+
+    The anchor is the authoritative lattice origin published by LMCache
+    (``Q = floor(prompt_len / chunk_size) * chunk_size``). Save, commit,
+    release and remap must share it, otherwise a ``window_size != chunk_size``
+    deployment could free tokens SFA still considers resident (design 12.1).
+    Returns ``None`` when no route table is published (callers fall back to the
+    zero-point lattice, which is only safe when ``window_size == chunk_size``).
+    """
+    snapshots = get_dsa_offload_routes(request_ids)
+    if snapshots is None:
+        return None
+    return [int(s.window_anchor) for s in snapshots]
+
+
+def batch_has_offloaded_decode_row(
+    snapshots: list[DSARouteSnapshot] | None,
+) -> bool:
+    """Whether the batch has at least one OFFLOADED decode row.
+
+    This drives ``need_sparse_lmcache_payload``: a batch needs the sparse
+    selective-load payload only when some row is actually offloaded (design
+    15.2 step 5), not merely when the connector advertises the capability.
+    """
+    return bool(snapshots) and any(s.is_offloaded for s in snapshots)
+
+
+def all_decode_requests_offloaded(
+    snapshots: list[DSARouteSnapshot] | None,
+) -> bool:
+    """Whether every active request is OFFLOADED.
+
+    The staged SFA graph requires a uniform offloaded route; any resident or
+    promoting row forces a fall-back to native per-row remap (design 14.4).
+    """
+    return bool(snapshots) and all(s.is_offloaded for s in snapshots)
+
+
+def batch_has_promoting_request(
+    snapshots: list[DSARouteSnapshot] | None,
+) -> bool:
+    """Whether any active request is currently PROMOTING.
+
+    A promoting request still has a fully resident forward, but it has a
+    full-prefix promotion save in flight. The SFA decode-save callback must run
+    for such steps even when the decode-window switch is off (window_size == 0),
+    otherwise the promotion save would never be dispatched (design 15.2 step 12).
+    """
+    return bool(snapshots) and any(
+        s.state == DSA_ROUTE_STATE_PROMOTING for s in snapshots
+    )
+
+
+def build_dsa_compact_route(
+    route_snapshots: list[DSARouteSnapshot] | None,
+    decode_req_indices: Any,
+) -> tuple[list[int], list[int], list[int]] | None:
+    """Compute compact offloaded-request mappings for payload compression.
+
+    The production ``prepare_sparse_indices`` kernel indexes the request block
+    table by the request index carried on each row (``row_req_indices``). When
+    the payload is compressed to offloaded requests only, a compact view keeps
+    that indexing correct: the kernel receives a compact block table (gather of
+    the offloaded native rows) and compact row indices, so resident/padding rows
+    (mapped to -1) are skipped entirely and never occupy an LMCache payload row
+    (design 14.3). This is verified to match the native-order result for
+    offloaded rows.
+
+    Args:
+        route_snapshots: per-request route snapshots in native request order.
+        decode_req_indices: native request index for each decode row (any
+            iterable of ints); -1 marks padding/prefill rows.
+
+    Returns:
+        ``(row_to_offloaded_request, compact_to_native_request,
+        offloaded_native_indices)`` or ``None`` when no route table is
+        published or no request is offloaded.
+
+        * ``row_to_offloaded_request[row]``: compact offloaded index for an
+          OFFLOADED row, else -1. MTP rows of the same request share a compact
+          index.
+        * ``compact_to_native_request[c]``: native request index for compact
+          row ``c``.
+        * ``offloaded_native_indices``: native request indices that are
+          offloaded, in native order (used to gather the compact block table).
+    """
+    if not route_snapshots:
+        return None
+    native_to_compact: dict[int, int] = {}
+    compact_to_native: list[int] = []
+    offloaded_native: list[int] = []
+    for native_idx, snap in enumerate(route_snapshots):
+        if snap.is_offloaded:
+            native_to_compact[native_idx] = len(compact_to_native)
+            compact_to_native.append(native_idx)
+            offloaded_native.append(native_idx)
+    if not compact_to_native:
+        return None
+    row_to_offloaded = [
+        native_to_compact.get(int(req_idx), -1) for req_idx in decode_req_indices
+    ]
+    return row_to_offloaded, compact_to_native, offloaded_native
+
+
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     """Return a proven remap frontier for every active request.
 
@@ -343,6 +566,12 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     loadable dense-prefix request contributes zero because its first decoder
     step intentionally waits for the full prefix to become resident before
     attention, so compact-scratch remapping must remain disabled for it.
+
+    When the connector publishes a per-request DSA route table, the frontier is
+    taken from it directly: OFFLOADED rows contribute their committed_end while
+    RESIDENT/PROMOTING (and dense-prefix) rows contribute 0. This removes the
+    previous "active request has no proven frontier" failure for resident rows
+    in a mixed batch (design 8.2 / 15.2 step 4).
     """
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
@@ -351,6 +580,13 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
         raise RuntimeError("[SFA sparse remap] frontier lookup requires unique native request IDs.")
     if not normalized_request_ids:
         return []
+
+    # Route-table path: the connector publishes per-request OFFLOADED state +
+    # committed frontier. Resident/promoting/dense rows are 0 by construction.
+    route_snapshots = get_dsa_offload_routes(normalized_request_ids)
+    if route_snapshots is not None:
+        return dsa_route_frontier(route_snapshots)
+
     if not staged_sfa_connector_supports_sparse_load():
         raise RuntimeError(
             "[SFA sparse remap] the active connector does not advertise the "
@@ -415,6 +651,17 @@ def staged_sfa_metadata_sparse_load(
     active_request_ids = [str(req_id) for req_id in request_ids]
     if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
         return StagedSFARouteReason.INVALID_REQUEST_IDS, ()
+
+    # Route-table path: the staged SFA graph requires every active request to
+    # be OFFLOADED with a valid committed frontier. Any resident/promoting row
+    # (or a fully resident batch) routes to native per-row remap instead.
+    route_snapshots = get_dsa_offload_routes(active_request_ids)
+    if route_snapshots is not None:
+        if all_decode_requests_offloaded(route_snapshots):
+            frontiers = tuple(dsa_route_frontier(route_snapshots))
+            return StagedSFARouteReason.ELIGIBLE, frontiers
+        return StagedSFARouteReason.MIXED_DSA_ROUTE, ()
+
     active_request_id_set = set(active_request_ids)
     sparse_frontiers: dict[str, int] = {}
     dense_request_ids: set[str] = set()

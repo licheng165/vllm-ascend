@@ -163,6 +163,66 @@ def test_sparse_boundary_gathers_decode_window_without_cached_frontier():
     assert actual.tolist() == [512, 512, 768, 768, 0]
 
 
+def test_sparse_boundary_uses_route_window_anchor_when_window_ne_chunk():
+    """With window_size != chunk_size the remap must use the route anchor Q so
+    save/commit/release/remap share one lattice (design 12.1). Zero-point
+    alignment would diverge here."""
+    boundary_cpu = torch.tensor(
+        [11, 11, 22, 22, 0],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array(
+            [0, 0, 1, 1, -1],
+            dtype=np.int32,
+        ),
+        seq_lens_cpu=torch.tensor([513, 770], dtype=torch.int32),
+        num_decode_tokens=4,
+        decode_split_boundary=None,
+    )
+    # window=512, anchor Q=256 for both requests.
+    actual = _update_dsa_split_boundary_in_place(
+        metadata,
+        cached_tokens=None,
+        decode_window_size=512,
+        window_anchor=[256, 256],
+    )
+    # req0: pos=512 -> 256 + (512-256)//512*512 = 256
+    # req1: pos=769 -> 256 + (769-256)//512*512 = 768
+    assert actual.tolist() == [256, 256, 768, 768, 0]
+
+    # Zero-point (no anchor) would diverge for req0 -> 512, proving the anchor
+    # is actually consulted.
+    boundary_cpu2 = torch.tensor(
+        [11, 11, 22, 22, 0],
+        dtype=torch.int32,
+    )
+    metadata2 = SimpleNamespace(
+        split_boundary=boundary_cpu2.clone(),
+        decode_split_boundary_cpu=boundary_cpu2.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu2,
+        decode_req_indices_cpu=np.array(
+            [0, 0, 1, 1, -1],
+            dtype=np.int32,
+        ),
+        seq_lens_cpu=torch.tensor([513, 770], dtype=torch.int32),
+        num_decode_tokens=4,
+        decode_split_boundary=None,
+    )
+    zero_point = _update_dsa_split_boundary_in_place(
+        metadata2,
+        cached_tokens=None,
+        decode_window_size=512,
+    )
+    # Zero-point: req0 pos=512 -> 512, req1 pos=769 -> 512 (both //512*512).
+    # This diverges from the anchored req0=256, proving the anchor is consulted.
+    assert zero_point.tolist() == [512, 512, 512, 512, 0]
+
+
+
 def test_sparse_boundary_rejects_request_outside_seq_lens():
     boundary_cpu = torch.tensor([11, 22], dtype=torch.int32)
     metadata = SimpleNamespace(

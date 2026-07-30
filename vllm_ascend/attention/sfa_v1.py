@@ -51,7 +51,11 @@ from vllm_ascend.attention.mtp_dw_diag import (
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
+    batch_has_offloaded_decode_row,
+    batch_has_promoting_request,
     enable_cp,
+    get_dsa_offload_routes,
+    get_dsa_window_anchors,
     get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
     staged_sfa_connector_supports_sparse_load,
@@ -254,8 +258,17 @@ def _update_dsa_split_boundary_in_place(
     attn_metadata: Any,
     cached_tokens: list[int] | None,
     decode_window_size: int,
+    window_anchor: list[int] | None = None,
 ) -> torch.Tensor:
-    """Update the builder-owned row boundary without temporary device tensors."""
+    """Update the builder-owned row boundary without temporary device tensors.
+
+    ``window_anchor`` carries the per-request decode-window origin Q published by
+    LMCache (design 12.1). When provided, the window-start lattice is computed
+    as ``Q + (pos - Q)//window*window`` so save/commit/release/remap share one
+    lattice even when ``window_size != chunk_size``. When ``None`` (no route
+    table), the zero-point lattice is used, which is only safe when
+    ``window_size == chunk_size`` (enforced at startup).
+    """
     split_boundary = attn_metadata.split_boundary
     boundary_cpu = attn_metadata.decode_split_boundary_cpu
     boundary_cpu_tensor = attn_metadata.decode_split_boundary_cpu_tensor
@@ -341,10 +354,21 @@ def _update_dsa_split_boundary_in_place(
                 seq_lens[:num_reqs].astype(np.int64, copy=False) - 1,
                 0,
             )
-            window_starts = (
-                current_positions // decode_window_size
-                * decode_window_size
-            )
+            if window_anchor is not None and len(window_anchor) >= num_reqs:
+                # Shared anchor lattice: Q + (pos - Q)//window*window. This
+                # matches LMCache's save/commit/release lattice even when
+                # window_size != chunk_size (design 12.1).
+                anchors = np.asarray(
+                    window_anchor[:num_reqs], dtype=np.int64
+                )
+                window_starts = anchors + (
+                    (current_positions - anchors) // decode_window_size
+                ) * decode_window_size
+            else:
+                window_starts = (
+                    current_positions // decode_window_size
+                    * decode_window_size
+                )
             if has_cached_frontier:
                 np.minimum(
                     window_starts,
@@ -393,6 +417,28 @@ def _resolve_sparse_cached_tokens_by_request(
     ):
         cached_tokens[request_index] = int(committed_end)
     return cached_tokens
+
+
+def _resolve_dsa_window_anchors_by_request(
+    attn_metadata: Any,
+    request_ids: Any,
+) -> list[int] | None:
+    """Resolve per-request decode-window anchors Q in native request order.
+
+    Returns a list aligned to ``num_reqs`` (native request index -> anchor Q),
+    or ``None`` when no route table is published. The anchor is the shared
+    save/commit/release/remap lattice origin (design 12.1).
+    """
+    request_ids = list(request_ids) if request_ids is not None else []
+    anchors = get_dsa_window_anchors(request_ids)
+    if anchors is None:
+        return None
+    num_reqs = int(attn_metadata.seq_lens_cpu.shape[0])
+    # get_dsa_window_anchors is already in active-request (native) order; pad to
+    # num_reqs with 0 for any trailing requests absent from the table.
+    if len(anchors) < num_reqs:
+        anchors = list(anchors) + [0] * (num_reqs - len(anchors))
+    return anchors[:num_reqs]
 
 
 def _prepare_sfa_remap_boundary(
@@ -896,6 +942,13 @@ class AscendSFAMetadata:
     decode_req_indices_compact: torch.Tensor | None = None
     decode_req_indices_compact_cpu: Any = None
     decode_request_ids_compact: list[str] | None = None
+    # Compact offloaded-payload routing (design 14.3). Populated from the DSA
+    # route table when a compact view is in use; None keeps the legacy
+    # native-order (compact_idx == native_idx) behavior.
+    decode_row_to_offloaded_request: list[int] | None = None
+    decode_compact_to_native_request: list[int] | None = None
+    decode_offloaded_native_indices: list[int] | None = None
+    decode_compact_block_table: torch.Tensor | None = None
     decode_row_offsets: torch.Tensor | None = None
     decode_current_positions_cpu: Any = None
     split_boundary: torch.Tensor | None = None
@@ -1172,6 +1225,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_req_indices_compact = None
         decode_req_indices_compact_cpu = None
         decode_request_ids_compact = None
+        # Compact offloaded-payload routing (design 14.3).
+        row_to_offloaded_request = None
+        compact_to_native_request = None
+        offloaded_native_indices = None
+        compact_block_table = None
         row_offsets_rows = None
         decode_scratch_base_rows = None
         decode_scratch_base_compact = None
@@ -1415,6 +1473,34 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 self.dsa_shrink_latent != 3
                 and staged_sfa_connector_supports_sparse_load()
             )
+            # Per-request DSA routing: only build the sparse selective-load
+            # payload when the batch actually contains an OFFLOADED decode row.
+            # A fully RESIDENT/PROMOTING batch skips payload build, frontier
+            # lookup, remap and LMCache sparse wait entirely (design 15.2 step
+            # 5/9). When no route table is published, keep the legacy behavior.
+            route_req_ids = common_attn_metadata.request_ids
+            _route_snapshots = None
+            if route_req_ids is not None and need_sparse_lmcache_payload:
+                _route_snapshots = get_dsa_offload_routes(
+                    list(route_req_ids[:num_reqs])
+                )
+                if _route_snapshots is not None:
+                    need_sparse_lmcache_payload = batch_has_offloaded_decode_row(
+                        _route_snapshots
+                    )
+                    # Derive the offloaded native-request set from the route
+                    # table. This is pure data (no per-row dependency) and lets
+                    # downstream consumers (LMCache-Ascend payload validation)
+                    # know which requests carry a selective-load payload. The
+                    # per-row compact view (row_to_offloaded_request + compact
+                    # block-table gather) is gated behind NPU validation.
+                    offloaded_native_indices = [
+                        i
+                        for i, snap in enumerate(_route_snapshots)
+                        if snap.is_offloaded
+                    ]
+                    if offloaded_native_indices:
+                        compact_to_native_request = list(offloaded_native_indices)
             if num_decode_rows:
                 assert self._dsa_target_slots is not None
                 assert self._dsa_selected_tokens is not None
@@ -1544,6 +1630,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_req_indices_compact=decode_req_indices_compact,
             decode_req_indices_compact_cpu=decode_req_indices_compact_cpu,
             decode_request_ids_compact=decode_request_ids_compact,
+            decode_row_to_offloaded_request=row_to_offloaded_request,
+            decode_compact_to_native_request=compact_to_native_request,
+            decode_offloaded_native_indices=offloaded_native_indices,
+            decode_compact_block_table=compact_block_table,
             decode_row_offsets=row_offsets_rows,
             decode_current_positions_cpu=(
                 current_positions if decode_req_indices_rows is not None else None
@@ -3479,10 +3569,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.req_ids,
                 )
                 if _lmcache_cached_tokens is not None or _decode_window_size > 0:
+                    # Shared window anchor (design 12.1): use LMCache's
+                    # authoritative per-request Q so remap never diverges from
+                    # save/commit/release when window_size != chunk_size.
+                    _window_anchor = _resolve_dsa_window_anchors_by_request(
+                        attn_metadata,
+                        attn_metadata.req_ids,
+                    )
                     _split_boundary = _update_dsa_split_boundary_in_place(
                         attn_metadata,
                         _lmcache_cached_tokens,
                         _decode_window_size,
+                        window_anchor=_window_anchor,
                     )
                     if _decode_window_size > 0 and _mtp_dw_diag_enabled():
                         # Diagnostics only; these host values are intentionally
@@ -4207,7 +4305,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
         _decode_window_save_enabled = _decode_window_save_window_size() > 0
-        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
+        # Promotion metadata must trigger the decode-save callback even when the
+        # decode-window switch is off (window_size == 0); otherwise a request
+        # crossing the offload threshold could never persist its full prefix
+        # (design 15.2 step 12).
+        _promotion_in_flight = False
+        _save_req_ids = getattr(attn_metadata, "req_ids", None)
+        if _save_req_ids:
+            _promotion_in_flight = batch_has_promoting_request(
+                get_dsa_offload_routes(list(_save_req_ids))
+            )
+        _skip_decode_save = (
+            bool(self.dsa_shrink_latent)
+            and _is_pure_decode
+            and not _decode_window_save_enabled
+            and not _promotion_in_flight
+        )
         save_operations: list[tuple[str, list[torch.Tensor]]] = []
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
