@@ -630,6 +630,53 @@ class TestLMCacheSparseFrontier(TestBase):
             2,
         )
 
+    def test_fixed_staged_decode_layout_ignores_graph_padding_after_batch_shrink(
+        self,
+    ):
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, 1, 1, 2, 2, 3, 3],
+                4,
+                8,
+                pure_decode=True,
+            ),
+            2,
+        )
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, -1, -1],
+                2,
+                4,
+                pure_decode=True,
+            ),
+            2,
+        )
+        self.assertEqual(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, -1, -1, -1],
+                4,
+                4,
+                pure_decode=True,
+            ),
+            1,
+        )
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, 0, -1, -1],
+                1,
+                4,
+                pure_decode=True,
+            )
+        )
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0, -1, -1, -1],
+                1,
+                4,
+                pure_decode=True,
+            )
+        )
+
     def test_fixed_staged_decode_layout_falls_back_for_mixed_or_irregular(self):
         self.assertIsNone(
             sfa_v1._fixed_staged_decode_mtp(

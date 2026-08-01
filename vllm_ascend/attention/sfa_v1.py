@@ -644,31 +644,37 @@ def _fixed_staged_decode_mtp(
         return None
     request_rows = request_rows[:row_count]
     valid_rows = request_rows[request_rows >= 0]
-    if valid_rows.size:
-        if np.any(valid_rows >= request_count):
-            return None
-        counts = np.bincount(valid_rows, minlength=request_count)
-        max_mtp = int(counts.max(initial=0))
-        if max_mtp > 2:
-            raise RuntimeError(
-                "staged sparse-index preparation only supports MTP=1 or "
-                f"MTP=2; got MTP={max_mtp}"
-            )
-    if row_count % request_count:
+    if not valid_rows.size or np.any(valid_rows >= request_count):
         return None
-    mtp = row_count // request_count
+    counts = np.bincount(valid_rows, minlength=request_count)
+    max_mtp = int(counts.max(initial=0))
+    if max_mtp > 2:
+        raise RuntimeError(
+            "staged sparse-index preparation only supports MTP=1 or "
+            f"MTP=2; got MTP={max_mtp}"
+        )
+    active_request_count = int(np.count_nonzero(counts))
+    active_counts = counts[:active_request_count]
+    if (
+        active_request_count <= 0
+        or np.any(active_counts == 0)
+        or np.any(counts[active_request_count:] != 0)
+        or np.any(active_counts != active_counts[0])
+    ):
+        return None
+    mtp = int(active_counts[0])
     if mtp not in (1, 2):
-        if mtp > 2:
-            raise RuntimeError(
-                "staged sparse-index preparation only supports MTP=1 or "
-                f"MTP=2; got MTP={mtp}"
-            )
+        return None
+    if row_count != request_count * mtp:
         return None
     expected = np.repeat(
-        np.arange(request_count, dtype=np.int64),
+        np.arange(active_request_count, dtype=np.int64),
         mtp,
     )
-    if not np.array_equal(request_rows, expected):
+    valid_count = int(valid_rows.size)
+    if not np.array_equal(request_rows[:valid_count], expected):
+        return None
+    if np.any(request_rows[valid_count:] >= 0):
         return None
     return mtp
 
