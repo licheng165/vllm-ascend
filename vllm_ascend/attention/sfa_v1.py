@@ -367,22 +367,34 @@ def _update_dsa_split_boundary_in_place(
     # FALLBACK_RESIDENT) forces boundary=0 so resident rows keep absolute
     # indices and no sparse remap is generated.
     dsa_route_table = getattr(attn_metadata, "dsa_route_table", None)
-    if dsa_route_table:
+    if dsa_route_table is not None:
         for row_idx in range(num_rows):
             req_idx = int(row_req_indices[row_idx])
             if req_idx < 0:
                 continue
             entry = dsa_route_table.get(req_idx)
             if entry is None:
-                continue
+                raise RuntimeError(
+                    "DSA authoritative route is missing for active decode "
+                    f"request index {req_idx}."
+                )
             route_state, remap_end = entry
             if route_state == "sparse":
                 boundary_cpu[row_idx] = int(remap_end or 0)
             elif route_state == "legacy":
                 # keep the legacy-computed boundary above
                 pass
-            else:
+            elif route_state in (
+                "resident",
+                "promoting",
+                "fallback_resident",
+            ):
                 boundary_cpu[row_idx] = 0
+            else:
+                raise RuntimeError(
+                    "DSA route is not executable in normal forward: "
+                    f"request_index={req_idx}, route_state={route_state!r}."
+                )
 
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
@@ -391,17 +403,17 @@ def _update_dsa_split_boundary_in_place(
     # calls _validate_dsa_scratch_capacity; the native path must perform the
     # same fail-closed validation before kernel binding so an invalid boundary
     # (0 < b < scratch_capacity) cannot reach the kernel.
-    scratch_base_rows = getattr(attn_metadata, "decode_scratch_base_cpu", None)
     scratch_capacity = getattr(attn_metadata, "decode_scratch_capacity", None)
     if (
-        scratch_base_rows is not None
-        and scratch_capacity is not None
+        scratch_capacity is not None
         and getattr(attn_metadata, "num_decode_tokens", 0) > 0
     ):
         _validate_dsa_scratch_capacity(
             boundary_rows=boundary_cpu[:num_rows],
             row_req_indices=row_req_indices,
-            scratch_base_rows=scratch_base_rows,
+            scratch_base_rows=getattr(
+                attn_metadata, "decode_scratch_base_cpu", None
+            ),
             index_topk=index_topk,
             scratch_capacity=scratch_capacity,
         )
@@ -428,14 +440,62 @@ def _resolve_sparse_cached_tokens_by_request(
         raise RuntimeError(
             "[SFA sparse remap] active request IDs do not cover all decode rows."
         )
-    decode_request_ids = [
-        request_ids[request_index] for request_index in decode_request_indices
-    ]
-    resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
     cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
+    route_table = getattr(attn_metadata, "dsa_route_table", None)
+    lookup_request_indices = decode_request_indices
+    if route_table is not None:
+        lookup_request_indices = []
+        for request_index in decode_request_indices:
+            entry = route_table.get(request_index)
+            if entry is None:
+                raise RuntimeError(
+                    "[SFA sparse remap] authoritative route is missing for "
+                    f"active request index {request_index}."
+                )
+            route_state, remap_end = entry
+            if route_state in ("legacy", "sparse"):
+                if route_state == "sparse" and int(remap_end or 0) <= 0:
+                    raise RuntimeError(
+                        "[SFA sparse remap] SPARSE route has no positive "
+                        f"remap frontier for request index {request_index}."
+                    )
+                lookup_request_indices.append(request_index)
+            elif route_state not in (
+                "resident",
+                "promoting",
+                "fallback_resident",
+            ):
+                raise RuntimeError(
+                    "[SFA sparse remap] route is not executable in normal "
+                    f"forward: request_index={request_index}, "
+                    f"route_state={route_state!r}."
+                )
+
+    decode_request_ids = [
+        request_ids[request_index]
+        for request_index in lookup_request_indices
+    ]
+    resolved = (
+        get_lmcache_sparse_cached_tokens(decode_request_ids)
+        if decode_request_ids
+        else []
+    )
     for request_index, committed_end in zip(
-        decode_request_indices, resolved, strict=True
+        lookup_request_indices, resolved, strict=True
     ):
+        if route_table is not None:
+            route_state, remap_end = route_table[request_index]
+            if (
+                route_state == "sparse"
+                and int(committed_end) < int(remap_end)
+            ):
+                raise RuntimeError(
+                    "[SFA sparse remap] connector frontier does not cover "
+                    "the authoritative remap end: "
+                    f"request_index={request_index}, "
+                    f"connector_frontier={int(committed_end)}, "
+                    f"remap_end={int(remap_end)}."
+                )
         cached_tokens[request_index] = int(committed_end)
     return cached_tokens
 
@@ -939,6 +999,7 @@ class AscendSFAMetadata:
     # input_batch, not on CommonAttentionMetadata; the runner may need to thread them
     # in (see sparse_offload/INTEGRATION.md section B).
     req_ids: list[str] | None = None
+    dsa_route_table: dict[int, tuple[str, int]] | None = None
     prompt_lens: torch.Tensor | None = None
     decode_req_indices: torch.Tensor | None = None
     decode_req_indices_cpu: Any = None
@@ -1587,6 +1648,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
+            dsa_route_table=getattr(
+                common_attn_metadata, "dsa_route_table", None
+            ),
             prompt_lens=prompt_lens_rows,
             decode_req_indices=decode_req_indices_rows,
             decode_req_indices_cpu=decode_req_indices_cpu,

@@ -1812,14 +1812,50 @@ class NPUModelRunner(GPUModelRunner):
                 decode_req_ids = [
                     req_id for _, req_id in decode_requests
                 ]
+                frontier_requests = decode_requests
+                if self._dsa_route_table is not None:
+                    frontier_requests = []
+                    for request_index, req_id in decode_requests:
+                        route = self._dsa_route_table.get(request_index)
+                        if route is None:
+                            raise RuntimeError(
+                                "[SFA sparse remap] authoritative route is "
+                                "missing for diagnostic request index "
+                                f"{request_index}."
+                            )
+                        route_state, _ = route
+                        if route_state in ("legacy", "sparse"):
+                            frontier_requests.append((request_index, req_id))
+                        elif route_state not in (
+                            "resident",
+                            "promoting",
+                            "fallback_resident",
+                        ):
+                            raise RuntimeError(
+                                "[SFA sparse remap] route is not executable "
+                                "during diagnostics: "
+                                f"request_index={request_index}, "
+                                f"route_state={route_state!r}."
+                            )
+                frontier_req_ids = [
+                    req_id for _, req_id in frontier_requests
+                ]
                 committed_frontiers = (
-                    get_lmcache_sparse_cached_tokens(decode_req_ids)
-                    if decode_req_ids
-                    else None
+                    get_lmcache_sparse_cached_tokens(frontier_req_ids)
+                    if frontier_req_ids
+                    else ([] if decode_req_ids else None)
                 )
                 if committed_frontiers is not None:
+                    committed_by_req = dict(
+                        zip(
+                            frontier_req_ids,
+                            committed_frontiers,
+                            strict=True,
+                        )
+                    )
                     decode_committed_frontiers = [
-                        int(committed) for committed in committed_frontiers
+                        int(committed_by_req.get(req_id, 0))
+                        for req_id in decode_req_ids
                     ]
                     if decode_req_ids:
                         if previous_frontiers is None:
@@ -3005,14 +3041,15 @@ class NPUModelRunner(GPUModelRunner):
             if idx is None or idx >= num_reqs:
                 continue
             route_state = getattr(snapshot, "route_state", None)
-            route_state_str = (
-                getattr(route_state, "value", str(route_state))
-                if route_state is not None
-                else "legacy"
-            )
+            if route_state is None:
+                raise RuntimeError(
+                    "DSA route snapshot is missing route_state for request "
+                    f"{req_id!r}."
+                )
+            route_state_str = getattr(route_state, "value", str(route_state))
             remap_end = int(getattr(snapshot, "remap_end", 0) or 0)
             table[int(idx)] = (route_state_str, remap_end)
-        return table or None
+        return table
 
     def _staged_sfa_local_route(
         self,
@@ -3063,6 +3100,37 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
+        route_table = getattr(self, "_dsa_route_table", None)
+        sparse_routes: list[tuple[str, int]] | None = None
+        if route_table is not None:
+            active_routes = [route_table.get(index) for index in range(num_reqs)]
+            if any(route is None for route in active_routes):
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
+                )
+            route_states = {
+                route[0] for route in active_routes if route is not None
+            }
+            if route_states == {"legacy"}:
+                pass
+            elif route_states == {"sparse"}:
+                sparse_routes = [
+                    route for route in active_routes if route is not None
+                ]
+            elif route_states <= {
+                "legacy",
+                "sparse",
+                "resident",
+                "promoting",
+                "fallback_resident",
+            }:
+                return native(StagedSFARouteReason.MIXED_CONNECTOR_LOAD)
+            else:
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
+                )
         metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
             kv_connector_metadata,
             request_ids,
@@ -3081,6 +3149,36 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
+            )
+        if sparse_routes is not None:
+            loadable_sparse_ids = {
+                str(getattr(request, "req_id", ""))
+                for request in getattr(kv_connector_metadata, "requests", ())
+                if getattr(request, "is_sparse_decode", False)
+                and getattr(request, "load_spec", None) is not None
+                and getattr(request.load_spec, "can_load", False)
+            }
+            if any(str(req_id) not in loadable_sparse_ids for req_id in request_ids):
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+                )
+            if any(
+                int(remap_end) <= 0 or int(frontier) < int(remap_end)
+                for (_, remap_end), frontier in zip(
+                    sparse_routes,
+                    frontiers,
+                    strict=True,
+                )
+            ):
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.FRONTIER_TOO_SHORT,
+                )
+            # Connector coverage is proof only. Execution must use the
+            # Scheduler-authoritative remap boundary for this route epoch.
+            frontiers = tuple(
+                int(remap_end) for _, remap_end in sparse_routes
             )
         scratch_capacity = query_width * index_topk
         if any(

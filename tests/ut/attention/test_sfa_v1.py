@@ -209,6 +209,56 @@ def test_sparse_boundary_rejects_empty_frontiers_with_decode_rows():
         )
 
 
+def test_sparse_boundary_applies_authoritative_resident_and_sparse_routes():
+    boundary_cpu = torch.tensor([4096, 8192], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array([0, 1], dtype=np.int32),
+        seq_lens_cpu=torch.tensor([4097, 8193], dtype=torch.int32),
+        num_decode_tokens=2,
+        decode_split_boundary=None,
+        decode_scratch_base_cpu=None,
+        decode_scratch_capacity=8,
+        dsa_route_table={
+            0: ("resident", 0),
+            1: ("sparse", 8192),
+        },
+    )
+
+    actual = _update_dsa_split_boundary_in_place(
+        metadata,
+        cached_tokens=[4096, 8192],
+        decode_window_size=0,
+        index_topk=4,
+    )
+
+    assert actual.tolist() == [0, 8192]
+
+
+def test_sparse_boundary_rejects_missing_authoritative_route():
+    boundary_cpu = torch.tensor([8192], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        split_boundary=boundary_cpu.clone(),
+        decode_split_boundary_cpu=boundary_cpu.numpy(),
+        decode_split_boundary_cpu_tensor=boundary_cpu,
+        decode_req_indices_cpu=np.array([0], dtype=np.int32),
+        seq_lens_cpu=torch.tensor([8193], dtype=torch.int32),
+        num_decode_tokens=1,
+        decode_split_boundary=None,
+        dsa_route_table={},
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative route is missing"):
+        _update_dsa_split_boundary_in_place(
+            metadata,
+            cached_tokens=[8192],
+            decode_window_size=0,
+            index_topk=4,
+        )
+
+
 def test_sparse_boundary_prefers_explicit_committed_end():
     from vllm_ascend.attention import utils as attention_utils
 
@@ -483,6 +533,64 @@ class TestLMCacheSparseFrontier(TestBase):
                 ["resident", "offloaded"],
             ),
             (StagedSFARouteReason.ELIGIBLE, (0, 8192)),
+        )
+
+    def test_sparse_route_prefers_authoritative_remap_end(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="sparse",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=12288,
+                        dsa_committed_end=8192,
+                        dsa_remap_end=7680,
+                        dsa_route_state="sparse",
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["sparse"]),
+            [7680],
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["sparse"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (7680,)),
+        )
+
+    def test_legacy_route_ignores_zero_threshold_remap_end(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="legacy",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=12288,
+                        dsa_committed_end=8192,
+                        dsa_remap_end=0,
+                        dsa_route_state="legacy",
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["legacy"]),
+            [8192],
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["legacy"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (8192,)),
         )
 
     def test_mixed_load_requires_every_row_to_be_loadable(self):
@@ -842,6 +950,7 @@ class TestStagedSFAGraphPoc(TestBase):
             dtype=torch.int32,
         )
         metadata.decode_remap_boundary_ready = False
+        metadata.dsa_route_table = None
         return metadata
 
     def test_cross_layer_pre_uses_native_path_without_authorized_key(self):
@@ -1487,6 +1596,66 @@ class TestStagedSFAGraphPoc(TestBase):
 
         self.assertEqual(cached_tokens, [90, 0])
         lookup.assert_called_once_with(["decode-req"])
+
+    def test_native_resident_routes_do_not_require_connector_metadata(self):
+        metadata = self._make_decode_metadata(batch_size=2)
+        metadata.dsa_route_table = {
+            0: ("resident", 0),
+            1: ("promoting", 0),
+        }
+
+        with patch.object(
+            sfa_v1,
+            "get_lmcache_sparse_cached_tokens",
+        ) as lookup:
+            cached_tokens = sfa_v1._resolve_sparse_cached_tokens_by_request(
+                metadata,
+                ["resident", "promoting"],
+            )
+
+        self.assertEqual(cached_tokens, [0, 0])
+        lookup.assert_not_called()
+
+    def test_native_mixed_routes_only_look_up_sparse_requests(self):
+        metadata = self._make_decode_metadata(batch_size=3)
+        metadata.dsa_route_table = {
+            0: ("resident", 0),
+            1: ("sparse", 8192),
+            2: ("fallback_resident", 0),
+        }
+
+        with patch.object(
+            sfa_v1,
+            "get_lmcache_sparse_cached_tokens",
+            return_value=[8192],
+        ) as lookup:
+            cached_tokens = sfa_v1._resolve_sparse_cached_tokens_by_request(
+                metadata,
+                ["resident", "sparse", "fallback"],
+            )
+
+        self.assertEqual(cached_tokens, [0, 8192, 0])
+        lookup.assert_called_once_with(["sparse"])
+
+    def test_native_sparse_route_requires_connector_coverage(self):
+        metadata = self._make_decode_metadata()
+        metadata.dsa_route_table = {0: ("sparse", 8192)}
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_lmcache_sparse_cached_tokens",
+                return_value=[7936],
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "does not cover the authoritative remap end",
+            ),
+        ):
+            sfa_v1._resolve_sparse_cached_tokens_by_request(
+                metadata,
+                ["sparse"],
+            )
 
     def test_remap_boundary_uses_unique_request_ids_for_mtp_rows(self):
         metadata = self._make_decode_metadata()
@@ -2205,6 +2374,10 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 seq_lens=torch.tensor(computed, dtype=torch.int32),
                 seq_lens_cpu=torch.tensor(computed, dtype=torch.int32),
                 request_ids=request_ids,
+                dsa_route_table={
+                    request_index: ("resident", 0)
+                    for request_index in range(num_reqs)
+                },
                 attn_state=AscendAttentionState.DecodeOnly,
             )
 
@@ -2229,6 +2402,10 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert first.decode_req_indices.tolist() == [0, 0, 1, 1]
         assert first.decode_row_offsets.tolist() == [0, 1, 0, 1]
         assert first.num_decode_tokens == 4
+        assert first.dsa_route_table == {
+            0: ("resident", 0),
+            1: ("resident", 0),
+        }
 
         second = builder.build(
             common_prefix_len=0,

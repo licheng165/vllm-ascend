@@ -364,7 +364,43 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner.attn_state = AscendAttentionState.DecodeOnly
         runner._staged_sfa_graph_capture_sizes = (1, 4)
         runner._dp_batch_sync_buffers = {}
+        runner._dsa_route_table = None
         return runner
+
+    def test_dsa_route_table_preserves_authoritative_resident_route(self):
+        runner = self._build_runner()
+        runner.input_batch = SimpleNamespace(
+            req_id_to_index={"short": 0},
+        )
+        scheduler_output = SimpleNamespace(
+            dsa_routes={
+                "short": SimpleNamespace(
+                    route_state=SimpleNamespace(value="resident"),
+                    remap_end=0,
+                )
+            }
+        )
+
+        self.assertEqual(
+            runner._build_dsa_route_table(scheduler_output, num_reqs=1),
+            {0: ("resident", 0)},
+        )
+        self.assertEqual(
+            runner._build_dsa_route_table(
+                SimpleNamespace(dsa_routes={}),
+                num_reqs=1,
+            ),
+            None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing route_state"):
+            runner._build_dsa_route_table(
+                SimpleNamespace(
+                    dsa_routes={
+                        "short": SimpleNamespace(remap_end=0),
+                    }
+                ),
+                num_reqs=1,
+            )
 
     @staticmethod
     def _eligibility_kwargs(batch_size=4):
@@ -673,6 +709,91 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(route.reason, StagedSFARouteReason.ELIGIBLE)
             self.assertEqual(route.graph_key, StagedSFAGraphKey.exact_q1(4))
             self.assertEqual(route.frontiers, (4096,) * 4)
+
+            runner._dsa_route_table = {
+                index: ("resident", 0) for index in range(4)
+            }
+            resident_route = runner._staged_sfa_local_route(**local_kwargs)
+            self.assertEqual(
+                resident_route.action,
+                StagedSFARouteAction.SAFE_NATIVE,
+            )
+            self.assertEqual(
+                resident_route.reason,
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            )
+
+            runner._dsa_route_table = {
+                index: ("legacy", 0) for index in range(4)
+            }
+            legacy_route = runner._staged_sfa_local_route(**local_kwargs)
+            self.assertEqual(
+                legacy_route.action,
+                StagedSFARouteAction.STAGED,
+            )
+
+            runner._dsa_route_table = {
+                index: ("sparse", 4096) for index in range(4)
+            }
+            sparse_route = runner._staged_sfa_local_route(**local_kwargs)
+            self.assertEqual(
+                sparse_route.action,
+                StagedSFARouteAction.STAGED,
+            )
+
+            overcovered_kwargs = dict(local_kwargs)
+            overcovered_kwargs["kv_connector_metadata"] = SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id=req_id,
+                        is_sparse_decode=True,
+                        load_spec=SimpleNamespace(
+                            can_load=True,
+                            lmcache_cached_tokens=8192,
+                        ),
+                    )
+                    for req_id in request_ids
+                ]
+            )
+            overcovered_route = runner._staged_sfa_local_route(
+                **overcovered_kwargs
+            )
+            self.assertEqual(
+                overcovered_route.frontiers,
+                (4096,) * 4,
+            )
+
+            unavailable_kwargs = dict(local_kwargs)
+            unavailable_kwargs["kv_connector_metadata"] = SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id=req_id,
+                        is_sparse_decode=True,
+                        load_spec=SimpleNamespace(
+                            can_load=False,
+                            lmcache_cached_tokens=4096,
+                        ),
+                    )
+                    for req_id in request_ids
+                ]
+            )
+            unavailable_route = runner._staged_sfa_local_route(
+                **unavailable_kwargs
+            )
+            self.assertEqual(
+                unavailable_route.reason,
+                StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+            )
+
+            runner._dsa_route_table = {
+                index: ("sparse", 8192) for index in range(4)
+            }
+            uncovered_route = runner._staged_sfa_local_route(**local_kwargs)
+            self.assertEqual(
+                uncovered_route.reason,
+                StagedSFARouteReason.FRONTIER_TOO_SHORT,
+            )
+            runner._dsa_route_table = None
 
             one_request_kwargs = dict(local_kwargs)
             one_request_kwargs.update(

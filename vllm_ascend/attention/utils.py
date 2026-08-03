@@ -220,6 +220,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    # Authoritative Scheduler route indexed by request index:
+    # request_index -> (route_state, remap_end).
+    dsa_route_table: dict[int, tuple[str, int]] | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -248,6 +251,15 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
+            dsa_route_table=(
+                {
+                    request_index: route
+                    for request_index, route in self.dsa_route_table.items()
+                    if request_index < num_actual_reqs
+                }
+                if self.dsa_route_table is not None
+                else None
+            ),
         )
 
 
@@ -386,15 +398,27 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
                 "[SFA sparse remap] connector remap metadata contains a "
                 f"duplicate request ID: {req_id!r}."
             )
-        if is_dense_prefix_load:
-            cached_by_req[req_id] = 0
-        elif load_spec is None or not getattr(load_spec, "can_load", False):
+        if (
+            is_dense_prefix_load
+            or load_spec is None
+            or not getattr(load_spec, "can_load", False)
+        ):
             cached_by_req[req_id] = 0
         else:
+            route_state = getattr(load_spec, "dsa_route_state", None)
+            remap_end = (
+                getattr(load_spec, "dsa_remap_end", None)
+                if route_state == "sparse"
+                else None
+            )
             cached_by_req[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None) is not None
-                else getattr(load_spec, "lmcache_cached_tokens", 0)
+                remap_end
+                if remap_end is not None
+                else (
+                    getattr(load_spec, "dsa_committed_end", None)
+                    if getattr(load_spec, "dsa_committed_end", None) is not None
+                    else getattr(load_spec, "lmcache_cached_tokens", 0)
+                )
             )
 
     missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
@@ -428,14 +452,24 @@ def staged_sfa_metadata_sparse_load(
         if getattr(request, "is_sparse_decode", False):
             if req_id in sparse_frontiers:
                 return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+            route_state = getattr(load_spec, "dsa_route_state", None)
+            remap_end = (
+                getattr(load_spec, "dsa_remap_end", None)
+                if route_state == "sparse"
+                else None
+            )
             sparse_frontiers[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None)
-                is not None
+                remap_end
+                if remap_end is not None
                 else (
-                    getattr(load_spec, "lmcache_cached_tokens", 0)
-                    if getattr(load_spec, "can_load", False)
-                    else 0
+                    getattr(load_spec, "dsa_committed_end", None)
+                    if getattr(load_spec, "dsa_committed_end", None)
+                    is not None
+                    else (
+                        getattr(load_spec, "lmcache_cached_tokens", 0)
+                        if getattr(load_spec, "can_load", False)
+                        else 0
+                    )
                 )
                 or 0
             )
