@@ -326,6 +326,47 @@ class TestDSASparsePadding(TestBase):
         self.assertEqual(torch.count_nonzero(result[2:]).item(), 0)
 
 
+class TestDSADenseFastPathRows(TestBase):
+    def test_identity_rows_overwrite_only_short_rows(self):
+        index_topk = 8
+        topk = torch.arange(3 * index_topk, dtype=torch.int32).reshape(
+            3, 1, index_topk
+        )
+        short_rows = torch.tensor([True, False, True])
+        result = sfa_v1._dsa_apply_identity_rows(topk, short_rows, index_topk)
+        self.assertEqual(result.shape, topk.shape)
+        # Short rows become identity (0..topk-1); long row keeps indexer output.
+        expected_row0 = torch.arange(index_topk, dtype=torch.int32)
+        self.assertTrue(torch.equal(result[0, 0], expected_row0))
+        self.assertTrue(torch.equal(result[1], topk[1]))
+        self.assertTrue(torch.equal(result[2, 0], expected_row0))
+
+    def test_identity_rows_handles_2d_indices(self):
+        index_topk = 4
+        topk = torch.arange(2 * index_topk, dtype=torch.int32).reshape(2, index_topk)
+        short_rows = torch.tensor([True, False])
+        result = sfa_v1._dsa_apply_identity_rows(topk, short_rows, index_topk)
+        self.assertEqual(result.shape, topk.shape)
+        self.assertTrue(
+            torch.equal(
+                result[0], torch.arange(index_topk, dtype=torch.int32)
+            )
+        )
+        self.assertTrue(torch.equal(result[1], topk[1]))
+
+    def test_identity_rows_pads_short_mask_shorter_than_batch(self):
+        index_topk = 4
+        topk = torch.zeros(5, 1, index_topk, dtype=torch.int32)
+        short_rows = torch.tensor([True])
+        result = sfa_v1._dsa_apply_identity_rows(topk, short_rows, index_topk)
+        self.assertEqual(result.shape, topk.shape)
+        self.assertTrue(
+            torch.equal(
+                result[0, 0], torch.arange(index_topk, dtype=torch.int32)
+            )
+        )
+
+
 class TestLMCacheSparseFrontier(TestBase):
     @staticmethod
     def _remap_frontiers(metadata: object, request_ids: list[str]) -> list[int]:
