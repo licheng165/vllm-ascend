@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_ascend.dsa_threshold_config import build_dsa_threshold_config
 
 
@@ -48,3 +50,40 @@ def test_build_config_uses_final_geometry_and_lmcache_yaml(tmp_path, monkeypatch
     assert config.query_width == 2
     assert config.scratch_capacity == 4096
     assert config.first_reclaiming_frontier == 4352
+    assert config.deployment_mode == "pd"
+    assert config.node_role == "decode"
+
+
+def test_build_config_defaults_to_standalone(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD", "0")
+    vllm_config = _make_vllm_config()
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {}
+
+    config = build_dsa_threshold_config(vllm_config)
+
+    assert config.deployment_mode == "standalone"
+    assert config.node_role == "standalone"
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"dsa_deployment_mode": "pd"},
+        {"dsa_node_role": "prefill"},
+        {
+            "dsa_deployment_mode": "standalone",
+            "dsa_node_role": "decode",
+        },
+        {"dsa_deployment_mode": "pd", "dsa_node_role": "standalone"},
+    ],
+)
+def test_build_config_rejects_inconsistent_role(
+    monkeypatch,
+    extra_config: dict[str, str],
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD", "0")
+    vllm_config = _make_vllm_config()
+    vllm_config.kv_transfer_config.kv_connector_extra_config = extra_config
+
+    with pytest.raises(ValueError, match="Invalid DSA deployment"):
+        build_dsa_threshold_config(vllm_config)

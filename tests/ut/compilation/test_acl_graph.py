@@ -168,7 +168,7 @@ class TestACLGraphWrapper(TestBase):
         wrapper = ACLGraphWrapper(
             runnable=self.mock_runnable,
             vllm_config=self.mock_vllm_config,
-            runtime_mode=CUDAGraphMode.PIECEWISE,
+            runtime_mode=CUDAGraphMode.FULL,
             cudagraph_options=self.mock_cudagraph_options,
             synchronize_before_replay=False,
         )
@@ -181,9 +181,7 @@ class TestACLGraphWrapper(TestBase):
                 output=captured_output,
             )
         )
-        self.mock_forward_context.cudagraph_runtime_mode = (
-            CUDAGraphMode.PIECEWISE
-        )
+        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
         stream = MagicMock()
 
         with (
@@ -205,7 +203,7 @@ class TestACLGraphWrapper(TestBase):
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
-    def test_staged_replay_synchronization_policy(
+    def test_piecewise_replay_skips_host_synchronization(
         self,
         mock_envs,
         mock_current_platform,
@@ -215,20 +213,14 @@ class TestACLGraphWrapper(TestBase):
             self.mock_graph_pool
         )
         self.mock_vllm_config.speculative_config = None
-        # Exercise the fixed-width MTP dispatch key here: every token row in
-        # one request shares the same forward-level replay fence.
+        # Cover both the staged structural key and the generic descriptor.
         staged_key = StagedSFAGraphKey.fixed_spec(1, 2)
 
-        for name, graph_key, async_scheduling, expect_sync in (
-            ("staged_sync", staged_key, False, False),
-            ("staged_async", staged_key, True, True),
-            ("staged_unresolved", staged_key, None, True),
-            ("generic_sync", None, False, True),
+        for name, graph_key in (
+            ("staged", staged_key),
+            ("generic", None),
         ):
             with self.subTest(name=name):
-                self.mock_vllm_config.scheduler_config.async_scheduling = (
-                    async_scheduling
-                )
                 wrapper = ACLGraphWrapper(
                     runnable=self.mock_runnable,
                     vllm_config=self.mock_vllm_config,
@@ -247,7 +239,6 @@ class TestACLGraphWrapper(TestBase):
                     CUDAGraphMode.PIECEWISE
                 )
                 self.mock_forward_context.staged_sfa_graph_key = graph_key
-                self.mock_forward_context.staged_sfa_replay_fenced = False
                 stream = MagicMock()
 
                 with (
@@ -264,15 +255,12 @@ class TestACLGraphWrapper(TestBase):
                     result = wrapper()
 
                 self.assertIs(result, captured_output)
-                if expect_sync:
-                    stream.synchronize.assert_called_once_with()
-                else:
-                    stream.synchronize.assert_not_called()
+                stream.synchronize.assert_not_called()
                 graph.replay.assert_called_once_with()
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
-    def test_async_staged_replay_synchronizes_once_per_forward(
+    def test_full_replay_synchronizes_host_stream(
         self,
         mock_envs,
         mock_current_platform,
@@ -282,38 +270,27 @@ class TestACLGraphWrapper(TestBase):
             self.mock_graph_pool
         )
         self.mock_vllm_config.speculative_config = None
-        self.mock_vllm_config.scheduler_config.async_scheduling = True
-        staged_key = StagedSFAGraphKey.fixed_spec(1, 2)
-        first_graph, second_graph = MagicMock(), MagicMock()
-        wrappers = []
-        for graph in (first_graph, second_graph):
-            wrapper = ACLGraphWrapper(
-                runnable=self.mock_runnable,
-                vllm_config=self.mock_vllm_config,
-                runtime_mode=CUDAGraphMode.PIECEWISE,
-                cudagraph_options=self.mock_cudagraph_options,
-            )
-            wrapper.concrete_aclgraph_entries[staged_key] = ACLGraphEntry(
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
+            cudagraph_options=self.mock_cudagraph_options,
+        )
+        graph = MagicMock()
+        captured_output = object()
+        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = (
+            ACLGraphEntry(
                 batch_descriptor=self.mock_batch_descriptor,
                 aclgraph=graph,
-                output=object(),
+                output=captured_output,
             )
-            wrappers.append(wrapper)
-
-        def forward_context():
-            return Mock(
-                batch_descriptor=self.mock_batch_descriptor,
-                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
-                staged_sfa_graph_key=staged_key,
-                staged_sfa_replay_fenced=False,
-            )
-
-        context = forward_context()
+        )
+        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
         stream = MagicMock()
         with (
             patch(
                 'vllm_ascend.compilation.acl_graph.get_forward_context',
-                return_value=context,
+                return_value=self.mock_forward_context,
             ),
             patch.object(
                 torch.npu,
@@ -321,52 +298,11 @@ class TestACLGraphWrapper(TestBase):
                 return_value=stream,
             ),
         ):
-            wrappers[0]()
-            wrappers[1]()
+            result = wrapper()
 
+        self.assertIs(result, captured_output)
         stream.synchronize.assert_called_once_with()
-        self.assertTrue(context.staged_sfa_replay_fenced)
-        first_graph.replay.assert_called_once_with()
-        second_graph.replay.assert_called_once_with()
-
-        next_context = forward_context()
-        next_stream = MagicMock()
-        with (
-            patch(
-                'vllm_ascend.compilation.acl_graph.get_forward_context',
-                return_value=next_context,
-            ),
-            patch.object(
-                torch.npu,
-                'current_stream',
-                return_value=next_stream,
-            ),
-        ):
-            wrappers[0]()
-
-        next_stream.synchronize.assert_called_once_with()
-        self.assertTrue(next_context.staged_sfa_replay_fenced)
-        self.assertEqual(first_graph.replay.call_count, 2)
-
-        failed_context = forward_context()
-        failed_stream = MagicMock()
-        failed_stream.synchronize.side_effect = RuntimeError("fence failed")
-        with (
-            patch(
-                'vllm_ascend.compilation.acl_graph.get_forward_context',
-                return_value=failed_context,
-            ),
-            patch.object(
-                torch.npu,
-                'current_stream',
-                return_value=failed_stream,
-            ),
-            self.assertRaisesRegex(RuntimeError, "fence failed"),
-        ):
-            wrappers[0]()
-
-        self.assertFalse(failed_context.staged_sfa_replay_fenced)
-        self.assertEqual(first_graph.replay.call_count, 2)
+        graph.replay.assert_called_once_with()
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')

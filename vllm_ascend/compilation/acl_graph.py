@@ -74,9 +74,8 @@ class ACLGraphWrapper:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
-        # Generic wrappers keep the historical host fence because their input
-        # buffers can be updated by async scheduling. Narrow staged wrappers
-        # may opt out when their same-stream/event ordering is explicit.
+        # FULL replay normally needs a host fence before updated parameters
+        # are consumed. Callers with equivalent ordering may opt out.
         self.synchronize_before_replay = synchronize_before_replay
         self.compilation_config = vllm_config.compilation_config
 
@@ -254,41 +253,22 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        # In async scheduling or multi-threaded (MT) scenarios, input updates
-        # for iteration i can race with graph replay for iteration i-1. The
-        # first staged island retains that boundary fence; later islands in
-        # this forward use the explicit stream/event ordering around LMCache.
-        staged_piecewise_replay = (
-            staged_graph_key is not None
-            and self.runtime_mode == CUDAGraphMode.PIECEWISE
-        )
-        async_scheduling = self.vllm_config.scheduler_config.async_scheduling
-        stream_ordered_staged_replay = staged_piecewise_replay and (
-            async_scheduling is False
-            or (
-                async_scheduling is True
-                and getattr(forward_context, "staged_sfa_replay_fenced", False)
-            )
-        )
-        # If we do not in main model and in full-graph mode when using merge-eagle-graph,
-        # we do not need to synchronize.
+        # FULL replay needs a barrier before consuming parameters updated
+        # outside the graph. PIECEWISE relies on stream ordering instead;
+        # synchronizing every graph island causes a severe performance loss.
         use_eagle = (
             self.vllm_config.speculative_config.method in ("eagle", "eagle3")
             if self.vllm_config.speculative_config
             else False
         )
-        if (
+        is_draft_eagle = use_eagle and _EXTRA_CTX.is_draft_model
+        need_sync = (
             self.synchronize_before_replay
-            and not stream_ordered_staged_replay
-            and (
-                self.runtime_mode != CUDAGraphMode.FULL
-                or not _EXTRA_CTX.is_draft_model
-                or not use_eagle
-            )
-        ):
+            and self.runtime_mode == CUDAGraphMode.FULL
+            and not is_draft_eagle
+        )
+        if need_sync:
             torch.npu.current_stream().synchronize()
-            if staged_piecewise_replay and async_scheduling is True:
-                forward_context.staged_sfa_replay_fenced = True
         entry.aclgraph.replay()
         return entry.output
 

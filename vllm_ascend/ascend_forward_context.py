@@ -175,11 +175,6 @@ def set_ascend_forward_context(
         forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
         forward_context.staged_sfa_route = staged_sfa_route
         forward_context.staged_sfa_graph_key = staged_sfa_graph_key
-        # Async staged PIECEWISE replay fences only the first graph island in
-        # one model forward. ForwardContext is the ownership boundary for that
-        # state: MTP rows and all layer islands in this forward share it, while
-        # the next scheduler step must start unfenced.
-        forward_context.staged_sfa_replay_fenced = False
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

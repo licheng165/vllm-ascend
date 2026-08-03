@@ -148,8 +148,21 @@ def _read_node_role(vllm_config: Any) -> tuple[str, str]:
     extra = {}
     if ktc is not None:
         extra = getattr(ktc, "kv_connector_extra_config", None) or {}
-    deployment = str(extra.get("dsa_deployment_mode", "standalone"))
-    node_role = str(extra.get("dsa_node_role", deployment))
+    deployment = str(
+        extra.get("dsa_deployment_mode", "standalone")
+    ).lower()
+    node_role = str(extra.get("dsa_node_role", deployment)).lower()
+    valid_pairs = {
+        ("standalone", "standalone"),
+        ("pd", "prefill"),
+        ("pd", "decode"),
+    }
+    if (deployment, node_role) not in valid_pairs:
+        raise ValueError(
+            "Invalid DSA deployment configuration: expected "
+            "standalone/standalone, pd/prefill, or pd/decode; got "
+            f"deployment_mode={deployment!r}, node_role={node_role!r}"
+        )
     return deployment, node_role
 
 
