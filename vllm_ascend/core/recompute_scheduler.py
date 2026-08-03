@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, fields
 
 from vllm.config import SchedulerConfig, VllmConfig
@@ -41,7 +41,7 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
@@ -126,22 +126,7 @@ class RecomputeScheduler(Scheduler):
         )
 
     def add_request(self, request: Request) -> None:
-        existing = self.requests.get(request.request_id)
-        if existing is not None:
-            update = StreamingUpdate.from_request(request)
-            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
-                assert existing.streaming_queue is not None, "duplicate request id"
-                # Queue next input chunk (or finished sentinel).
-                existing.streaming_queue.append(update)
-            elif update is not None:
-                # Commence next input chunk.
-                self._update_request_as_session(existing, update)
-            else:
-                # Streaming-input session finished.
-                self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
-        else:
-            if request.resumable:
-                request.streaming_queue = deque()
+        if request.request_id not in self.requests:
             # Fill in placeholder tokens to enable full graph compatibility. Without
             # placeholders, graph matching may fail, forcing eager mode execution.
             if self.is_kv_producer and self.is_hybrid_model and request.num_tokens > 1:
@@ -150,10 +135,10 @@ class RecomputeScheduler(Scheduler):
                 request.num_prompt_tokens -= 1
             if self.is_mtp_kv_consumer:
                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
-            if self.log_stats:
-                request.record_event(EngineCoreEventType.QUEUED)
+
+        # Keep Ascend-specific request normalization above, but delegate common
+        # admission to vLLM so DSA state and future base invariants are applied.
+        super().add_request(request)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
@@ -776,6 +761,8 @@ class RecomputeScheduler(Scheduler):
             recomputed_reqs=recomputed_reqs,
         )
 
+        self._attach_dsa_route_snapshots(scheduler_output)
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -989,7 +976,10 @@ class RecomputeScheduler(Scheduler):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
-            self._update_from_kv_xfer_finished(kv_connector_output)
+            self._update_from_kv_xfer_finished(
+                kv_connector_output,
+                blocked_release_req_ids=failed_kv_load_req_ids,
+            )
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()

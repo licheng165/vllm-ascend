@@ -18,12 +18,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
-from vllm_ascend import envs
-
+import yaml
 from vllm.logger import logger
+
+from vllm_ascend import envs
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -96,6 +98,45 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _read_lmcache_chunk_size(*, required: bool) -> int:
+    raw = os.getenv("LMCACHE_CHUNK_SIZE")
+    source = "LMCACHE_CHUNK_SIZE"
+    if raw is None or raw == "":
+        config_path = os.getenv("LMCACHE_CONFIG_FILE")
+        if config_path:
+            source = f"LMCACHE_CONFIG_FILE ({config_path})"
+            try:
+                config = yaml.safe_load(
+                    Path(config_path).read_text(encoding="utf-8")
+                )
+            except (OSError, yaml.YAMLError) as exc:
+                if required:
+                    raise ValueError(
+                        "Unable to read LMCache chunk_size from "
+                        f"{source}: {exc}"
+                    ) from exc
+                config = None
+            if config is not None and not isinstance(config, dict):
+                if required:
+                    raise ValueError(f"{source} must contain a YAML mapping")
+                config = None
+            raw = config.get("chunk_size") if config else None
+
+    if raw is None or raw == "":
+        return 256
+    try:
+        chunk_size = int(raw)
+    except (TypeError, ValueError) as exc:
+        if not required:
+            return 256
+        raise ValueError(f"LMCache chunk_size from {source} must be an integer") from exc
+    if chunk_size <= 0:
+        if not required:
+            return 256
+        raise ValueError(f"LMCache chunk_size from {source} must be positive")
+    return chunk_size
+
+
 def _read_node_role(vllm_config: Any) -> tuple[str, str]:
     """Read dsa_deployment_mode / dsa_node_role from kv_connector_extra_config.
 
@@ -122,8 +163,6 @@ def build_dsa_threshold_config(vllm_config: Any) -> DSAThresholdConfig:
 
     model_config = getattr(vllm_config, "model_config", None)
     cache_config = getattr(vllm_config, "cache_config", None)
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    parallel_config = getattr(vllm_config, "parallel_config", None)
 
     block_size = int(getattr(cache_config, "block_size", 0) or 0) if cache_config else 0
     max_model_len = (
@@ -133,18 +172,14 @@ def build_dsa_threshold_config(vllm_config: Any) -> DSAThresholdConfig:
     # Frontier parameters come from the LMCache runtime config / hf config.
     hf_config = getattr(model_config, "hf_text_config", None) if model_config else None
     index_topk = int(getattr(hf_config, "index_topk", 0) or 0) if hf_config else 0
-    num_speculative_tokens = (
-        int(getattr(model_config, "num_speculative_tokens", 0) or 0)
-        if model_config
-        else 0
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
     )
     query_width = 1 + max(num_speculative_tokens, 0)
     scratch_capacity = query_width * index_topk if index_topk > 0 else 0
 
-    chunk_size = _env_int("LMCACHE_CHUNK_SIZE", 0) or _env_int("chunk_size", 0)
-    if chunk_size == 0:
-        # LMCache adapter exposes chunk_size via config; fall back to block_size.
-        chunk_size = block_size
+    chunk_size = _read_lmcache_chunk_size(required=threshold > 0)
     window_size = _env_int("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", 0)
 
     deployment, node_role = _read_node_role(vllm_config)
@@ -291,7 +326,6 @@ def _validate_startup_prerequisites(vllm_config: Any, cfg: DSAThresholdConfig) -
 
 def _data_compatibility_fingerprint(cfg: DSAThresholdConfig, vllm_config: Any) -> str:
     model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_text_config", None) if model_config else None
     payload = {
         "model": str(getattr(model_config, "model", "")) if model_config else "",
         "dtype": str(getattr(model_config, "dtype", "")) if model_config else "",
