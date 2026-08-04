@@ -3021,10 +3021,36 @@ class NPUModelRunner(GPUModelRunner):
             kv_connector_metadata,
             request_ids,
         )
-        if metadata_reason in (
-            StagedSFARouteReason.DENSE_PREFIX_HIT,
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-        ):
+        if metadata_reason == StagedSFARouteReason.DENSE_PREFIX_HIT:
+            # Short-context dense fast-path (方案 A): the whole prefix is
+            # resident in the block table, so a zero frontier (no compact-
+            # scratch remap) is provable — the exact case the staged graph
+            # supports (baseline short requests were ELIGIBLE with frontier
+            # zero). Route these steps through the captured graph instead of
+            # the eager native fallback: the eager path re-runs the entire
+            # sparse machinery per layer per step, and it drags the idle DP's
+            # dummy off the graph via the route all-reduce, collapsing TPOT to
+            # hundreds of milliseconds with single-digit NPU utilization.
+            active_request_ids = {str(req_id) for req_id in request_ids}
+            prefix_resident = all(
+                bool(
+                    getattr(getattr(request, "load_spec", None), "can_load", False)
+                )
+                for request in getattr(kv_connector_metadata, "requests", ())
+                if str(getattr(request, "req_id", "")) in active_request_ids
+            )
+            if not prefix_resident:
+                # First decode step: the prefix load is still in flight and
+                # the eager path's per-layer connector waits perform the KV
+                # transfer itself. Staged replay would see a zero payload and
+                # attend over blocks the load has not filled yet.
+                return native(metadata_reason)
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.STAGED,
+                StagedSFARouteReason.DENSE_PREFIX_HIT,
+                frontiers=(0,) * num_reqs,
+            )
+        if metadata_reason == StagedSFARouteReason.MIXED_CONNECTOR_LOAD:
             return native(metadata_reason)
         # Missing/unavailable connector metadata is NOT fatal: the dense
         # fast-path (方案 A) makes short requests is_sparse_decode=False, and a
