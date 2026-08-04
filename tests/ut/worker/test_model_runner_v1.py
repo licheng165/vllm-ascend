@@ -800,6 +800,63 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
             self.assertEqual(route.reason, StagedSFARouteReason.NOT_DECODE)
 
+    def test_missing_or_unavailable_connector_metadata_falls_back_native(
+        self,
+    ):
+        """Regression: with the dense fast-path (方案 A), a short request may
+        have no connector metadata entry (e.g. no load spec). The staged-SFA
+        local route must fall back to SAFE_NATIVE for
+        MISSING_CONNECTOR_METADATA and SPARSE_LOAD_UNAVAILABLE instead of
+        FATAL, otherwise the DP route becomes fatal (runtime_parallelism on the
+        peer) and real inference crashes."""
+        runner = self._build_runner()
+        request_ids = [f"req-{index}" for index in range(4)]
+        base = {
+            "num_tokens_unpadded": 4,
+            "num_reqs": 4,
+            "num_scheduled_tokens": np.ones(4, dtype=np.int32),
+            "index_topk": 2048,
+            "has_cascade_attention": False,
+            "request_ids": request_ids,
+        }
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 4),
+            ),
+        ):
+            for metadata, expected_reason in (
+                (None, StagedSFARouteReason.MISSING_CONNECTOR_METADATA),
+                (
+                    SimpleNamespace(requests=[]),
+                    StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
+                ),
+                (
+                    SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=False,
+                                load_spec=None,
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                    StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+                ),
+            ):
+                with self.subTest(metadata=metadata):
+                    route = runner._staged_sfa_local_route(
+                        **base,
+                        kv_connector_metadata=metadata,
+                    )
+                    self.assertEqual(
+                        route.action,
+                        StagedSFARouteAction.SAFE_NATIVE,
+                    )
+                    self.assertEqual(route.reason, expected_reason)
+
     def test_non_native_routes_report_stable_action_and_reason(self):
         runner = self._build_runner()
         for action in (

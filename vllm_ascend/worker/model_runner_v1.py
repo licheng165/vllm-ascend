@@ -3026,6 +3026,17 @@ class NPUModelRunner(GPUModelRunner):
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
         ):
             return native(metadata_reason)
+        # Missing/unavailable connector metadata is NOT fatal: the dense
+        # fast-path (方案 A) makes short requests is_sparse_decode=False, and a
+        # short request whose metadata is absent (e.g. no load spec) must
+        # simply fall back to native attention rather than kill the step.
+        # These reasons are also reached transiently (async lookup, decode
+        # window save-only metas), so failing closed would crash valid steps.
+        if metadata_reason in (
+            StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
+            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+        ):
+            return native(metadata_reason)
         if metadata_reason != StagedSFARouteReason.ELIGIBLE:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
