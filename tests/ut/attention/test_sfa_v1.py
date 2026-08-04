@@ -578,6 +578,28 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()),
         )
 
+    def test_dense_request_first_decode_step_is_dense_prefix_hit(self):
+        """Regression: a dense fast-path request whose first decode step has
+        can_load=False (prefix not yet resident) must classify as
+        DENSE_PREFIX_HIT (SAFE_NATIVE), not SPARSE_LOAD_UNAVAILABLE (FATAL),
+        so the staged-SFA local route does not become fatal across DP."""
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="dense",
+                    is_sparse_decode=False,
+                    load_spec=SimpleNamespace(can_load=False),
+                )
+            ]
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["dense"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+        )
+
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
         self,
     ) -> None:

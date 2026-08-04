@@ -1500,8 +1500,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         _dsa_dense_query_lens: list[int] | None = None
         _dsa_dense_seq_lens: list[int] | None = None
         _dsa_dense_rows: torch.Tensor | None = None
+        # The staged SFA graph (D-node PIECEWISE) routes/captures the sparse
+        # path; disable the dense fast-path there (forward also enforces this).
+        _dsa_dense_disabled = (
+            self.enable_dsa_cp or staged_sfa_graph_configured(self.vllm_config)
+        )
         if (
-            not self.enable_dsa_cp
+            not _dsa_dense_disabled
             and self.dsa_dense_threshold > 0
             and seq_lens_cpu is not None
             and seq_lens_cpu.numel() > 0
@@ -1609,6 +1614,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # the sparse path. Requires the shrink-latent row -> request mapping.
         if (
             not _dsa_dense_decode
+            and not _dsa_dense_disabled
             and self.dsa_dense_threshold > 0
             and seq_lens_cpu is not None
             and seq_lens_cpu.numel() > 0
@@ -2628,7 +2634,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         block_size = self.block_size
         k_nope = kv_cache[0].view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
         k_pe = kv_cache[1].view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
-        if self.speculative_config is not None:
+        # Spec-decode (MTP) iff decode_threshold > 1
+        # (decode_threshold = 1 + num_speculative_tokens).
+        if self.decode_threshold > 1:
             # Mirrors mla_v1's spec-decode branch: TND query, NTD output
             # (num_heads, num_tokens, kv_lora_rank).
             q_nope = ql_nope.view(num_tokens, self.num_heads, -1).contiguous()
@@ -3497,11 +3505,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_dense_decode = bool(getattr(attn_metadata, "dsa_dense_decode", False))
         if _dsa_dense_decode and (
             self.use_sparse_c8_indexer
+            or self.enable_staged_sfa_graph
             or (
                 self.enable_mlapo
                 and attn_metadata.num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
             )
         ):
+            # The staged SFA graph (PIECEWISE, D-node) routes and captures the
+            # sparse path; its per-layer callbacks (cross_layer_graph_pre /
+            # remap / union buffers) assume sparse machinery. Disable the dense
+            # attention kernel there so staged graphs are unaffected; the dense
+            # LOAD path (LMCache) and dense TRANSFER (connector) still apply.
             _dsa_dense_decode = False
         if self._dsa_dense_path_log and _is_pure_decode:
             self._log_dsa_dense_decode_step(attn_metadata, _dsa_dense_decode)
