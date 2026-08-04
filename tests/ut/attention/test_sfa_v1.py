@@ -600,6 +600,37 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
         )
 
+    def test_sparse_request_with_save_only_meta_is_not_duplicate(self):
+        """Regression: a long (sparse) request whose decode-window-save meta
+        (load_spec=None, is_sparse_decode=False, same req_id) is emitted in the
+        same step must still classify as ELIGIBLE, not DUPLICATE_SPARSE_LOAD.
+        Save-only metas are not dense loads and must not collide with the main
+        request's sparse frontier."""
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="long",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8192,
+                    ),
+                ),
+                SimpleNamespace(
+                    req_id="long",
+                    is_sparse_decode=False,
+                    load_spec=None,
+                ),
+            ]
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["long"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (8192,)),
+        )
+
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
         self,
     ) -> None:

@@ -441,11 +441,15 @@ def staged_sfa_metadata_sparse_load(
             )
             continue
         # Dense fast-path request (is_sparse_decode=False): classify as a
-        # dense-prefix load regardless of can_load. The first decode step has
+        # dense-prefix load regardless of can_load (the first decode step has
         # can_load=False before the prefix is resident; treating it as
         # SPARSE_LOAD_UNAVAILABLE would make the staged-SFA local route fatal
-        # (runtime_parallelism across DP) instead of falling back to native.
-        dense_request_ids.add(req_id)
+        # across DP). Save-only metas (load_spec is None, e.g. a decode-window
+        # save sharing the same req_id as the main decode request) are NOT
+        # dense loads: classifying them here would collide with the main
+        # request's sparse frontier (DUPLICATE_SPARSE_LOAD).
+        if load_spec is not None:
+            dense_request_ids.add(req_id)
 
     if dense_request_ids.intersection(sparse_frontiers):
         return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
