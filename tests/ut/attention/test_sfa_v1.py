@@ -248,6 +248,123 @@ def test_sparse_boundary_prefers_explicit_committed_end():
         assert attention_utils.get_lmcache_sparse_cached_tokens(["resident", "offloaded"]) == [0, 8192]
 
 
+def _remap_connector(requests):
+    return SimpleNamespace(
+        supports_staged_sfa_sparse_load=True,
+        uses_layerwise_model_callbacks=True,
+        wait_for_layer_load=lambda *_args, **_kwargs: None,
+        _get_connector_metadata=lambda: SimpleNamespace(requests=requests),
+    )
+
+
+def _run_remap_resolution(requests, request_ids):
+    from vllm_ascend.attention import utils as attention_utils
+
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(
+            attention_utils,
+            "get_kv_transfer_group",
+            return_value=_remap_connector(requests),
+        ),
+    ):
+        return attention_utils.get_lmcache_sparse_cached_tokens(request_ids)
+
+
+def test_dense_request_first_decode_step_is_proven_with_zero_frontier():
+    """Regression: 0804-3. A short request (方案 A) is is_sparse_decode=False;
+    on its first decode step can_load is still False, so the remap resolution
+    must prove it with a zero frontier (no compact-scratch remap) instead of
+    raising 'no proven sparse frontier'."""
+    assert _run_remap_resolution(
+        [
+            SimpleNamespace(
+                req_id="short-req",
+                is_sparse_decode=False,
+                load_spec=SimpleNamespace(can_load=False),
+            )
+        ],
+        ["short-req"],
+    ) == [0]
+
+
+def test_dense_request_without_load_spec_is_proven_with_zero_frontier():
+    """Regression: 0804-3. A short request with neither load nor save spec
+    (no connector metadata entry semantics) must resolve to zero, not raise."""
+    from vllm_ascend.attention import utils as attention_utils
+
+    assert _run_remap_resolution(
+        [
+            SimpleNamespace(
+                req_id="short-req",
+                is_sparse_decode=False,
+                load_spec=None,
+            )
+        ],
+        ["short-req"],
+    ) == [0]
+
+
+def test_save_only_meta_never_overrides_sparse_frontier():
+    """Regression: a decode-window save-only meta (load_spec=None) sharing the
+    main request's req_id must not clobber the sparse frontier or raise a
+    duplicate, regardless of metadata order."""
+    from vllm_ascend.attention import utils as attention_utils
+
+    main = SimpleNamespace(
+        req_id="long-req",
+        is_sparse_decode=True,
+        load_spec=SimpleNamespace(
+            can_load=True,
+            lmcache_cached_tokens=8192,
+            dsa_committed_end=8192,
+        ),
+    )
+    save_only = SimpleNamespace(
+        req_id="long-req",
+        is_sparse_decode=False,
+        load_spec=None,
+    )
+    assert _run_remap_resolution([main, save_only], ["long-req"]) == [8192]
+    assert _run_remap_resolution([save_only, main], ["long-req"]) == [8192]
+
+
+def test_active_request_absent_from_metadata_falls_back_to_dense():
+    """Regression: 0804-3. An active request absent from the connector metadata
+    (async lookup not yet complete) must fail open with a zero frontier."""
+    from vllm_ascend.attention import utils as attention_utils
+
+    assert _run_remap_resolution([], ["short-req"]) == [0]
+
+
+def test_duplicate_sparse_metas_still_raise():
+    with pytest.raises(RuntimeError, match="duplicate request ID"):
+        _run_remap_resolution(
+            [
+                SimpleNamespace(
+                    req_id="long-req",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=4096,
+                        dsa_committed_end=4096,
+                    ),
+                ),
+                SimpleNamespace(
+                    req_id="long-req",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8192,
+                        dsa_committed_end=8192,
+                    ),
+                ),
+            ],
+            ["long-req"],
+        )
+
+
 def _staged_route(frontiers=(4096,)):
     return StagedSFARouteDecision(
         StagedSFARouteAction.STAGED,

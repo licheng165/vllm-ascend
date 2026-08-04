@@ -340,9 +340,13 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     """Return a proven remap frontier for every active request.
 
     Sparse-decode metadata contributes its committed LMCache frontier. A
-    loadable dense-prefix request contributes zero because its first decoder
-    step intentionally waits for the full prefix to become resident before
-    attention, so compact-scratch remapping must remain disabled for it.
+    non-sparse decode request (dense fast-path / dense-prefix load) contributes
+    zero because it reads its full prefix from the block table, so compact-
+    scratch remapping must remain disabled for it. A save-only meta (decode-
+    window save sharing the main request's req_id) never overrides an existing
+    frontier, and an active request absent from the metadata is treated as
+    dense (zero frontier) — matching the route-level fallback to native
+    attention.
     """
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
@@ -365,16 +369,32 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     except Exception as exc:
         raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
 
-    cached_by_req: dict[str, int] = {}
+    sparse_by_req: dict[str, int] = {}
     for request in getattr(metadata, "requests", ()):
-        is_sparse_decode = bool(getattr(request, "is_sparse_decode", False))
+        if not getattr(request, "is_sparse_decode", False):
+            continue
+        req_id = str(getattr(request, "req_id", ""))
+        if not req_id:
+            raise RuntimeError(
+                "[SFA sparse remap] connector remap metadata has an empty request ID."
+            )
+        if req_id in sparse_by_req:
+            raise RuntimeError(
+                "[SFA sparse remap] connector remap metadata contains a "
+                f"duplicate request ID: {req_id!r}."
+            )
         load_spec = getattr(request, "load_spec", None)
-        is_dense_prefix_load = bool(
-            not is_sparse_decode
-            and load_spec is not None
-            and getattr(load_spec, "can_load", False)
-        )
-        if not is_sparse_decode and not is_dense_prefix_load:
+        if load_spec is None or not getattr(load_spec, "can_load", False):
+            sparse_by_req[req_id] = 0
+        else:
+            sparse_by_req[req_id] = int(
+                getattr(load_spec, "dsa_committed_end", None)
+                if getattr(load_spec, "dsa_committed_end", None) is not None
+                else getattr(load_spec, "lmcache_cached_tokens", 0)
+            )
+    cached_by_req: dict[str, int] = dict(sparse_by_req)
+    for request in getattr(metadata, "requests", ()):
+        if getattr(request, "is_sparse_decode", False):
             continue
         req_id = str(getattr(request, "req_id", ""))
         if not req_id:
@@ -382,26 +402,19 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
                 "[SFA sparse remap] connector remap metadata has an empty request ID."
             )
         if req_id in cached_by_req:
-            raise RuntimeError(
-                "[SFA sparse remap] connector remap metadata contains a "
-                f"duplicate request ID: {req_id!r}."
-            )
-        if is_dense_prefix_load:
-            cached_by_req[req_id] = 0
-        elif load_spec is None or not getattr(load_spec, "can_load", False):
-            cached_by_req[req_id] = 0
-        else:
-            cached_by_req[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None) is not None
-                else getattr(load_spec, "lmcache_cached_tokens", 0)
-            )
+            # Save-only meta (decode-window save) sharing the main request's
+            # req_id: keep the recorded sparse frontier / dense zero entry.
+            continue
+        # Dense fast-path request or dense-prefix load: no compact-scratch
+        # remap, so the request is proven with a zero frontier.
+        cached_by_req[req_id] = 0
 
-    missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
-    if missing:
-        raise RuntimeError(
-            f"[SFA sparse remap] connector metadata has no proven sparse frontier for active requests: {missing!r}."
-        )
+    for req_id in normalized_request_ids:
+        # Fail open: an active request absent from the metadata (e.g. async
+        # lookup not yet complete, or a short request with neither load nor
+        # save) cannot be remapped; treat it as dense instead of killing the
+        # step. The route already fell back to native attention for it.
+        cached_by_req.setdefault(req_id, 0)
     return [cached_by_req[req_id] for req_id in normalized_request_ids]
 
 
