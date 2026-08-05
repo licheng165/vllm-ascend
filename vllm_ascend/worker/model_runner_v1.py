@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import hashlib
 import json
 import math
 import os
@@ -55,6 +56,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
+from vllm.v1.core.sched.dsa_types import DSAExecutionReceipt, DSASourceLease
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -70,7 +72,6 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
-    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -331,6 +332,73 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     staged_sfa_graph_key: StagedSFAGraphKey | None
+    dsa_execution_context: dict[str, "_DSARequestExecutionContext"]
+
+
+@dataclass(frozen=True)
+class _DSARequestExecutionContext:
+    """Immutable pre-forward inputs needed for an execution receipt."""
+
+    route_snapshot: Any
+    pre_forward_computed: int
+    scheduled_tokens: int
+    draft_tokens: int
+    prompt_end: int
+    exact_token_end: int
+    token_bytes: bytes
+
+
+def _dsa_token_prefix_digest(
+    execution: _DSARequestExecutionContext,
+    completed_canonical_end: int,
+) -> str:
+    """Hash exact canonical token IDs, or return an empty fail-closed digest.
+
+    The encoding is the completed canonical end as an unsigned big-endian
+    int64 followed by signed big-endian int64 token IDs. Prompt embeddings and
+    async placeholders make the corresponding prefix inexact, so those
+    executions intentionally carry no digest instead of hashing invented token
+    IDs.
+    """
+    if completed_canonical_end > execution.exact_token_end:
+        return ""
+    byte_end = completed_canonical_end * 8
+    if byte_end > len(execution.token_bytes):
+        return ""
+    digest = hashlib.sha256(usedforsecurity=False)
+    digest.update(
+        completed_canonical_end.to_bytes(
+            8,
+            byteorder="big",
+            signed=False,
+        )
+    )
+    digest.update(execution.token_bytes[:byte_end])
+    return digest.hexdigest()
+
+
+class _AsyncNPUReceiptOutput(AsyncModelRunnerOutput):
+    """Preserve DSA receipts through another async output wrapper."""
+
+    def __init__(
+        self,
+        output: AsyncModelRunnerOutput,
+        dsa_execution_context: dict[str, _DSARequestExecutionContext],
+    ) -> None:
+        self._output = output
+        self._dsa_execution_context = dsa_execution_context
+
+    def get_output(self) -> ModelRunnerOutput:
+        output = self._output.get_output()
+        output.dsa_execution_receipts = (
+            NPUModelRunner._build_dsa_execution_receipts(
+                self._dsa_execution_context,
+                output.sampled_token_ids,
+                output.req_id_to_index,
+                NPUModelRunner._drain_released_dsa_source_leases(),
+            )
+        )
+        return output
 
 
 def _fixed_decode_layout_arrays(
@@ -1433,7 +1501,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | IntermediateTensors | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1513,6 +1581,9 @@ class NPUModelRunner(GPUModelRunner):
                 # the existing prompt-phase behavior.
                 self._dsa_route_table = self._build_dsa_route_table(
                     scheduler_output, num_reqs
+                )
+                dsa_execution_context = (
+                    self._capture_dsa_execution_context(scheduler_output)
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -1921,11 +1992,26 @@ class NPUModelRunner(GPUModelRunner):
                     output = self._pool(
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
-                    output.kv_connector_output = kv_connector_output
+                    if isinstance(output, AsyncModelRunnerOutput):
+                        receipt_output = _AsyncNPUReceiptOutput(
+                            output,
+                            dsa_execution_context,
+                        )
+                    else:
+                        output.kv_connector_output = kv_connector_output
+                        output.dsa_execution_receipts = (
+                            self._build_dsa_execution_receipts(
+                                dsa_execution_context,
+                                output.sampled_token_ids,
+                                output.req_id_to_index,
+                                self._drain_released_dsa_source_leases(),
+                            )
+                        )
+                        receipt_output = output
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
-                    return output
+                    return receipt_output
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
@@ -1965,6 +2051,7 @@ class NPUModelRunner(GPUModelRunner):
                 cudagraph_stats,
                 batch_desc,
                 staged_sfa_graph_key,
+                dsa_execution_context,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -2009,6 +2096,7 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
             batch_desc,
             staged_sfa_graph_key,
+            dsa_execution_context,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2123,7 +2211,12 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
-                    completed_decode_window_saves = self.finalize_kv_connector()
+                    kv_connector_output = self.finalize_kv_connector(
+                        kv_connector_output
+                    )
+                    completed_decode_window_saves = (
+                        kv_connector_output.completed_decode_window_saves
+                    )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2143,19 +2236,6 @@ class NPUModelRunner(GPUModelRunner):
                                 completed_decode_window_saves.get(req_id)
                             ),
                         )
-                    if completed_decode_window_saves:
-                        if kv_connector_output is None:
-                            kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
-                            kv_connector_output.completed_decode_window_saves[
-                                req_id
-                            ] = max(
-                                kv_connector_output.completed_decode_window_saves.get(
-                                    req_id, 0
-                                ),
-                                window_end,
-                            )
-
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -2201,14 +2281,25 @@ class NPUModelRunner(GPUModelRunner):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
+            model_runner_output.dsa_execution_receipts = (
+                self._build_dsa_execution_receipts(
+                    dsa_execution_context,
+                    valid_sampled_token_ids,
+                    req_id_to_index_output_copy,
+                    self._drain_released_dsa_source_leases(),
+                )
+            )
             return model_runner_output
-        return AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
+        return _AsyncNPUReceiptOutput(
+            AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            ),
+            dsa_execution_context=dsa_execution_context,
         )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -3048,8 +3139,249 @@ class NPUModelRunner(GPUModelRunner):
                 )
             route_state_str = getattr(route_state, "value", str(route_state))
             remap_end = int(getattr(snapshot, "remap_end", 0) or 0)
+            if route_state_str == "sparse":
+                source_lease = getattr(snapshot, "source_lease", None)
+                active_generation = getattr(
+                    snapshot, "active_source_generation_id", None
+                )
+                valid_source_lease = bool(
+                    source_lease is not None
+                    and getattr(source_lease, "source_lease_id", None)
+                    and active_generation
+                    and getattr(
+                        snapshot, "active_source_receipt_bundle_id", None
+                    )
+                    and getattr(snapshot, "active_token_prefix_digest", None)
+                    and getattr(source_lease, "request_key", None)
+                    == getattr(snapshot, "request_key", None)
+                    and getattr(source_lease, "execution_seq", None)
+                    == getattr(snapshot, "execution_seq", None)
+                    and getattr(source_lease, "route_epoch", None)
+                    == getattr(snapshot, "route_epoch", None)
+                    and getattr(source_lease, "source_generation_id", None)
+                    == active_generation
+                )
+                if not valid_source_lease:
+                    raise RuntimeError(
+                        "DSA SPARSE route has no valid source lease for "
+                        f"request {req_id!r}."
+                    )
             table[int(idx)] = (route_state_str, remap_end)
         return table
+
+    def _capture_dsa_execution_context(
+        self,
+        scheduler_output: Any,
+    ) -> dict[str, _DSARequestExecutionContext]:
+        """Snapshot worker state before target rows are executed."""
+        dsa_routes = getattr(scheduler_output, "dsa_routes", None)
+        if not dsa_routes:
+            return {}
+
+        contexts: dict[str, _DSARequestExecutionContext] = {}
+        req_id_to_index = self.input_batch.req_id_to_index
+        for req_id, scheduled_tokens_value in (
+            scheduler_output.num_scheduled_tokens.items()
+        ):
+            route_snapshot = dsa_routes.get(req_id)
+            if route_snapshot is None:
+                continue
+            req_index = req_id_to_index.get(req_id)
+            if req_index is None or req_index >= self.input_batch.num_reqs:
+                raise RuntimeError(
+                    "DSA route has no active input-batch row for request "
+                    f"{req_id!r}."
+                )
+
+            pre_forward_computed = int(
+                self.input_batch.num_computed_tokens_cpu[req_index]
+            )
+            scheduled_tokens = int(scheduled_tokens_value)
+            draft_tokens = len(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            )
+            if scheduled_tokens <= 0 or draft_tokens > scheduled_tokens:
+                raise RuntimeError(
+                    "Invalid DSA target-row counts for request "
+                    f"{req_id!r}: scheduled={scheduled_tokens}, "
+                    f"drafts={draft_tokens}."
+                )
+
+            max_completed_end = pre_forward_computed + scheduled_tokens
+            exact_token_end = 0
+            token_bytes = b""
+            token_ids_cpu = getattr(self.input_batch, "token_ids_cpu", None)
+            is_token_ids = getattr(self.input_batch, "is_token_ids", None)
+            if token_ids_cpu is not None and is_token_ids is not None:
+                captured_token_end = min(
+                    max_completed_end,
+                    token_ids_cpu.shape[1],
+                )
+                token_ids = np.asarray(
+                    token_ids_cpu[req_index, :captured_token_end],
+                    dtype=">i8",
+                )
+                token_bytes = token_ids.tobytes()
+                exact_mask = np.asarray(
+                    is_token_ids[req_index, :captured_token_end],
+                    dtype=bool,
+                ) & (token_ids >= 0)
+                inexact_positions = np.flatnonzero(~exact_mask)
+                exact_token_end = (
+                    int(inexact_positions[0])
+                    if inexact_positions.size
+                    else captured_token_end
+                )
+
+            contexts[req_id] = _DSARequestExecutionContext(
+                route_snapshot=route_snapshot,
+                pre_forward_computed=pre_forward_computed,
+                scheduled_tokens=scheduled_tokens,
+                draft_tokens=draft_tokens,
+                prompt_end=int(
+                    self.input_batch.num_prompt_tokens[req_index]
+                ),
+                exact_token_end=exact_token_end,
+                token_bytes=token_bytes,
+            )
+        return contexts
+
+    @staticmethod
+    def _drain_released_dsa_source_leases() -> tuple[DSASourceLease, ...]:
+        """Drain leases only after the connector has fenced source use."""
+        if not has_kv_transfer_group():
+            return ()
+        return tuple(
+            get_kv_transfer_group().get_released_dsa_source_leases()
+        )
+
+    @staticmethod
+    def _build_dsa_execution_receipts(
+        execution_context: dict[str, _DSARequestExecutionContext],
+        valid_sampled_token_ids: list[list[int]],
+        req_id_to_index: dict[str, int],
+        released_source_leases: tuple[DSASourceLease, ...] = (),
+    ) -> dict[str, DSAExecutionReceipt]:
+        """Build worker-confirmed receipts after sampling and connector fences."""
+        released_by_execution: dict[
+            tuple[Any, int, int], DSASourceLease
+        ] = {}
+        for lease in released_source_leases:
+            identity = (
+                lease.request_key,
+                lease.execution_seq,
+                lease.route_epoch,
+            )
+            if identity in released_by_execution:
+                raise RuntimeError(
+                    "DSA connector released more than one source lease for "
+                    f"execution {identity!r}."
+                )
+            released_by_execution[identity] = lease
+
+        receipts: dict[str, DSAExecutionReceipt] = {}
+        for req_id, execution in execution_context.items():
+            req_index = req_id_to_index.get(req_id)
+            if req_index is None:
+                raise RuntimeError(
+                    "DSA execution result has no output row for request "
+                    f"{req_id!r}."
+                )
+            if valid_sampled_token_ids:
+                if req_index >= len(valid_sampled_token_ids):
+                    raise RuntimeError(
+                        "DSA execution result is missing sampled-token row "
+                        f"{req_index} for request {req_id!r}."
+                    )
+                valid_generated_count = len(
+                    valid_sampled_token_ids[req_index]
+                )
+            else:
+                valid_generated_count = 0
+
+            draft_tokens = execution.draft_tokens
+            accepted_drafts = min(
+                draft_tokens,
+                max(valid_generated_count - 1, 0),
+            )
+            completed_canonical_end = (
+                execution.pre_forward_computed
+                + execution.scheduled_tokens
+                - draft_tokens
+                + accepted_drafts
+            )
+            snapshot = execution.route_snapshot
+            accepted_end_at_execution = int(snapshot.accepted_end)
+            # Stop strings, EOS, and max-token trimming are Scheduler-owned.
+            # Draft rows cannot be called canonical until that post-forward
+            # acceptance is known, so prove them on the next execution instead.
+            completed_canonical_end = min(
+                completed_canonical_end,
+                accepted_end_at_execution,
+            )
+            if completed_canonical_end < 0:
+                raise RuntimeError(
+                    "DSA worker-confirmed canonical frontier is negative for "
+                    f"request {req_id!r}: C={completed_canonical_end}."
+                )
+
+            external_computed_end = max(
+                0,
+                min(
+                    int(snapshot.external_computed_end),
+                    completed_canonical_end,
+                ),
+            )
+            # The first target row that is not canonical after MTP rejection
+            # correction is C itself; never report the optimistic last row.
+            min_position_of_next_target_rows = completed_canonical_end
+            execution_identity = (
+                snapshot.request_key,
+                int(snapshot.execution_seq),
+                int(snapshot.route_epoch),
+            )
+            released_source_lease = released_by_execution.pop(
+                execution_identity,
+                None,
+            )
+            expected_source_lease = getattr(snapshot, "source_lease", None)
+            if (
+                released_source_lease is not None
+                and released_source_lease != expected_source_lease
+            ):
+                raise RuntimeError(
+                    "DSA connector released a source lease that does not "
+                    f"match the route snapshot for request {req_id!r}."
+                )
+            receipts[req_id] = DSAExecutionReceipt(
+                request_key=snapshot.request_key,
+                execution_seq=int(snapshot.execution_seq),
+                route_epoch=int(snapshot.route_epoch),
+                accepted_end_at_execution=accepted_end_at_execution,
+                completed_canonical_end=completed_canonical_end,
+                external_computed_end=external_computed_end,
+                initial_prefill_complete=(
+                    completed_canonical_end >= execution.prompt_end
+                ),
+                min_position_of_next_target_rows=(
+                    min_position_of_next_target_rows
+                ),
+                token_prefix_digest=_dsa_token_prefix_digest(
+                    execution,
+                    completed_canonical_end,
+                ),
+                released_source_lease_id=(
+                    released_source_lease.source_lease_id
+                    if released_source_lease is not None
+                    else None
+                ),
+            )
+        if released_by_execution:
+            raise RuntimeError(
+                "DSA connector released source leases for executions outside "
+                f"the current model batch: {tuple(released_by_execution)!r}."
+            )
+        return receipts
 
     def _staged_sfa_local_route(
         self,

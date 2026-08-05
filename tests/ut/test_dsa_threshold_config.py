@@ -42,6 +42,14 @@ def test_build_config_uses_final_geometry_and_lmcache_yaml(tmp_path, monkeypatch
     monkeypatch.setenv("VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD", "8192")
     monkeypatch.setenv("LMCACHE_CONFIG_FILE", str(config_file))
     monkeypatch.delenv("LMCACHE_CHUNK_SIZE", raising=False)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    monkeypatch.setenv("LMCACHE_ENABLE_SPARSE_ATTENTION", "true")
+    monkeypatch.setenv("LMCACHE_USE_LAYERWISE", "true")
+    monkeypatch.setenv("LMCACHE_DSA_TWO_GROUPS", "true")
+    monkeypatch.setenv("LMCACHE_SAVE_UNFULL_CHUNK", "true")
+    monkeypatch.setenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "256")
 
     config = build_dsa_threshold_config(_make_vllm_config())
 
@@ -52,6 +60,30 @@ def test_build_config_uses_final_geometry_and_lmcache_yaml(tmp_path, monkeypatch
     assert config.first_reclaiming_frontier == 4352
     assert config.deployment_mode == "pd"
     assert config.node_role == "decode"
+
+
+def test_positive_threshold_rejects_missing_prerequisites(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_file = tmp_path / "lmcache.yaml"
+    config_file.write_text("chunk_size: 256\n", encoding="utf-8")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD", "8192")
+    monkeypatch.setenv("LMCACHE_CONFIG_FILE", str(config_file))
+    for name in (
+        "VLLM_ASCEND_DSA_UNBUNDLE",
+        "VLLM_ASCEND_DSA_TWO_GROUPS",
+        "VLLM_ASCEND_DSA_SHRINK_LATENT",
+        "LMCACHE_ENABLE_SPARSE_ATTENTION",
+        "LMCACHE_USE_LAYERWISE",
+        "LMCACHE_DSA_TWO_GROUPS",
+        "LMCACHE_SAVE_UNFULL_CHUNK",
+        "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ValueError, match="startup prerequisites are not met"):
+        build_dsa_threshold_config(_make_vllm_config())
 
 
 def test_build_config_defaults_to_standalone(monkeypatch) -> None:

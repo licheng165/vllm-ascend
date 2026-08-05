@@ -213,7 +213,7 @@ def build_dsa_threshold_config(vllm_config: Any) -> DSAThresholdConfig:
         native_boundary_validation=True,
     )
 
-    # _validate_startup_prerequisites(vllm_config, cfg)
+    _validate_startup_prerequisites(vllm_config, cfg)
 
     # Build capability fingerprints (design section 4.2).
     cfg.data_compatibility_fingerprint = _data_compatibility_fingerprint(cfg, vllm_config)

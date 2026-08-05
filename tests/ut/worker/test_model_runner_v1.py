@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
@@ -8,6 +9,11 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
+from vllm.v1.core.sched.dsa_types import (
+    DSAExecutionReceipt,
+    DSASourceLease,
+    RequestKey,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 import vllm_ascend.worker.model_runner_v1 as model_runner_module
@@ -353,6 +359,335 @@ class TestQueryStartPadding(unittest.TestCase):
         runner.query_start_loc.copy_to_gpu.assert_called_once_with()
 
 
+class TestDSAExecutionReceipts(unittest.TestCase):
+    request_id = "dsa-request"
+
+    @staticmethod
+    def _expected_digest(canonical_end: int) -> str:
+        digest = hashlib.sha256(usedforsecurity=False)
+        digest.update(canonical_end.to_bytes(8, byteorder="big"))
+        for token_id in range(1, canonical_end + 1):
+            digest.update(
+                token_id.to_bytes(8, byteorder="big", signed=True)
+            )
+        return digest.hexdigest()
+
+    @staticmethod
+    def _route(
+        *,
+        accepted_end: int,
+        external_computed_end: int = 0,
+        source_lease: DSASourceLease | None = None,
+    ) -> SimpleNamespace:
+        request_key = RequestKey(
+            process_instance_id="scheduler-instance",
+            request_id=TestDSAExecutionReceipts.request_id,
+            scope_id=17,
+        )
+        return SimpleNamespace(
+            request_key=request_key,
+            execution_seq=29,
+            route_epoch=7,
+            accepted_end=accepted_end,
+            external_computed_end=external_computed_end,
+            route_state=SimpleNamespace(
+                value="sparse" if source_lease is not None else "resident"
+            ),
+            remap_end=0,
+            source_lease=source_lease,
+        )
+
+    @classmethod
+    def _build_receipt(
+        cls,
+        *,
+        pre_forward_computed: int,
+        scheduled_tokens: int,
+        draft_tokens: int,
+        valid_generated_count: int,
+        prompt_end: int,
+        accepted_end: int,
+        external_computed_end: int = 0,
+        inexact_position: int | None = None,
+        source_lease: DSASourceLease | None = None,
+        released_source_leases: tuple[DSASourceLease, ...] = (),
+    ) -> DSAExecutionReceipt:
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        token_ids = np.arange(1, 65, dtype=np.int32).reshape(1, -1)
+        is_token_ids = np.ones_like(token_ids, dtype=bool)
+        if draft_tokens:
+            is_token_ids[
+                0,
+                accepted_end : accepted_end + draft_tokens,
+            ] = False
+        if inexact_position is not None:
+            is_token_ids[0, inexact_position] = False
+        runner.input_batch = SimpleNamespace(
+            req_id_to_index={cls.request_id: 0},
+            num_reqs=1,
+            num_computed_tokens_cpu=np.array(
+                [pre_forward_computed], dtype=np.int32
+            ),
+            num_prompt_tokens=np.array([prompt_end], dtype=np.int32),
+            token_ids_cpu=token_ids,
+            is_token_ids=is_token_ids,
+        )
+        route = cls._route(
+            accepted_end=accepted_end,
+            external_computed_end=external_computed_end,
+            source_lease=source_lease,
+        )
+        scheduler_output = SimpleNamespace(
+            dsa_routes={cls.request_id: route},
+            num_scheduled_tokens={cls.request_id: scheduled_tokens},
+            scheduled_spec_decode_tokens={
+                cls.request_id: token_ids[
+                    0,
+                    accepted_end : accepted_end + draft_tokens,
+                ].tolist()
+            }
+            if draft_tokens
+            else {},
+        )
+        context = runner._capture_dsa_execution_context(scheduler_output)
+        receipts = runner._build_dsa_execution_receipts(
+            context,
+            [list(range(valid_generated_count))],
+            {cls.request_id: 0},
+            released_source_leases,
+        )
+        return receipts[cls.request_id]
+
+    def test_chunked_prefill_uses_executed_rows_without_sample(self):
+        first_chunk = self._build_receipt(
+            pre_forward_computed=0,
+            scheduled_tokens=4,
+            draft_tokens=0,
+            valid_generated_count=0,
+            prompt_end=8,
+            accepted_end=8,
+            external_computed_end=6,
+        )
+        self.assertEqual(first_chunk.completed_canonical_end, 4)
+        self.assertEqual(first_chunk.external_computed_end, 4)
+        self.assertFalse(first_chunk.initial_prefill_complete)
+        self.assertEqual(
+            first_chunk.token_prefix_digest,
+            self._expected_digest(4),
+        )
+
+        final_chunk = self._build_receipt(
+            pre_forward_computed=4,
+            scheduled_tokens=4,
+            draft_tokens=0,
+            valid_generated_count=0,
+            prompt_end=8,
+            accepted_end=8,
+        )
+        self.assertEqual(final_chunk.completed_canonical_end, 8)
+        self.assertTrue(final_chunk.initial_prefill_complete)
+
+    def test_normal_decode_advances_one_canonical_row(self):
+        receipt = self._build_receipt(
+            pre_forward_computed=8,
+            scheduled_tokens=1,
+            draft_tokens=0,
+            valid_generated_count=1,
+            prompt_end=8,
+            accepted_end=9,
+            external_computed_end=99,
+        )
+
+        self.assertEqual(receipt.completed_canonical_end, 9)
+        self.assertEqual(receipt.external_computed_end, 9)
+        self.assertEqual(receipt.min_position_of_next_target_rows, 9)
+        self.assertEqual(
+            receipt.token_prefix_digest,
+            self._expected_digest(9),
+        )
+        self.assertIsNone(receipt.released_source_lease_id)
+
+    def test_mtp_defers_draft_canonicalization_until_next_execution(self):
+        for valid_generated_count in (3, 2, 1):
+            with self.subTest(valid_generated_count=valid_generated_count):
+                receipt = self._build_receipt(
+                    pre_forward_computed=10,
+                    scheduled_tokens=3,
+                    draft_tokens=2,
+                    valid_generated_count=valid_generated_count,
+                    prompt_end=8,
+                    accepted_end=11,
+                )
+                self.assertEqual(
+                    receipt.completed_canonical_end,
+                    11,
+                )
+                self.assertEqual(
+                    receipt.min_position_of_next_target_rows,
+                    11,
+                )
+                self.assertEqual(
+                    receipt.token_prefix_digest,
+                    self._expected_digest(11),
+                )
+
+    def test_receipt_echoes_route_identity(self):
+        receipt = self._build_receipt(
+            pre_forward_computed=4,
+            scheduled_tokens=1,
+            draft_tokens=0,
+            valid_generated_count=1,
+            prompt_end=4,
+            accepted_end=123,
+        )
+
+        self.assertEqual(
+            receipt.request_key,
+            RequestKey(
+                process_instance_id="scheduler-instance",
+                request_id=self.request_id,
+                scope_id=17,
+            ),
+        )
+        self.assertEqual(receipt.execution_seq, 29)
+        self.assertEqual(receipt.route_epoch, 7)
+        self.assertEqual(receipt.accepted_end_at_execution, 123)
+
+    def test_inexact_tokens_leave_digest_fail_closed(self):
+        receipt = self._build_receipt(
+            pre_forward_computed=0,
+            scheduled_tokens=4,
+            draft_tokens=0,
+            valid_generated_count=0,
+            prompt_end=4,
+            accepted_end=4,
+            inexact_position=2,
+        )
+
+        self.assertEqual(receipt.token_prefix_digest, "")
+
+    def test_sparse_receipt_reports_only_exact_released_source_lease(self):
+        request_key = RequestKey(
+            process_instance_id="scheduler-instance",
+            request_id=self.request_id,
+            scope_id=17,
+        )
+        lease = DSASourceLease(
+            source_lease_id="lease-29",
+            request_key=request_key,
+            execution_seq=29,
+            route_epoch=7,
+            source_generation_id="generation-1",
+        )
+
+        receipt = self._build_receipt(
+            pre_forward_computed=8,
+            scheduled_tokens=1,
+            draft_tokens=0,
+            valid_generated_count=1,
+            prompt_end=8,
+            accepted_end=9,
+            source_lease=lease,
+            released_source_leases=(lease,),
+        )
+
+        self.assertEqual(receipt.released_source_lease_id, "lease-29")
+
+    def test_sparse_receipt_without_release_proof_fails_closed(self):
+        lease = DSASourceLease(
+            source_lease_id="lease-29",
+            request_key=RequestKey(
+                process_instance_id="scheduler-instance",
+                request_id=self.request_id,
+                scope_id=17,
+            ),
+            execution_seq=29,
+            route_epoch=7,
+            source_generation_id="generation-1",
+        )
+
+        receipt = self._build_receipt(
+            pre_forward_computed=8,
+            scheduled_tokens=1,
+            draft_tokens=0,
+            valid_generated_count=1,
+            prompt_end=8,
+            accepted_end=9,
+            source_lease=lease,
+        )
+
+        self.assertIsNone(receipt.released_source_lease_id)
+
+    def test_sparse_receipt_rejects_mismatched_release_proof(self):
+        request_key = RequestKey(
+            process_instance_id="scheduler-instance",
+            request_id=self.request_id,
+            scope_id=17,
+        )
+        expected = DSASourceLease(
+            source_lease_id="lease-29",
+            request_key=request_key,
+            execution_seq=29,
+            route_epoch=7,
+            source_generation_id="generation-1",
+        )
+        stale = DSASourceLease(
+            source_lease_id="stale-lease",
+            request_key=request_key,
+            execution_seq=29,
+            route_epoch=7,
+            source_generation_id="stale-generation",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            self._build_receipt(
+                pre_forward_computed=8,
+                scheduled_tokens=1,
+                draft_tokens=0,
+                valid_generated_count=1,
+                prompt_end=8,
+                accepted_end=9,
+                source_lease=expected,
+                released_source_leases=(stale,),
+            )
+
+    def test_source_lease_drain_uses_connector_public_api(self):
+        lease = MagicMock()
+        connector = MagicMock()
+        connector.get_released_dsa_source_leases.return_value = [lease]
+
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            released = NPUModelRunner._drain_released_dsa_source_leases()
+
+        self.assertEqual(released, (lease,))
+        connector.get_released_dsa_source_leases.assert_called_once_with()
+
+    def test_request_without_route_has_no_receipt(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.input_batch = SimpleNamespace()
+        scheduler_output = SimpleNamespace(dsa_routes={})
+
+        context = runner._capture_dsa_execution_context(scheduler_output)
+        receipts = runner._build_dsa_execution_receipts(
+            context,
+            [],
+            {},
+        )
+
+        self.assertEqual(receipts, {})
+
+
 class TestStagedSFADummyBatch(unittest.TestCase):
     @staticmethod
     def _build_runner():
@@ -397,6 +732,26 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 SimpleNamespace(
                     dsa_routes={
                         "short": SimpleNamespace(remap_end=0),
+                    }
+                ),
+                num_reqs=1,
+            )
+
+    def test_sparse_route_requires_complete_source_lease(self):
+        runner = self._build_runner()
+        runner.input_batch = SimpleNamespace(
+            req_id_to_index={"long": 0},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "valid source lease"):
+            runner._build_dsa_route_table(
+                SimpleNamespace(
+                    dsa_routes={
+                        "long": SimpleNamespace(
+                            route_state=SimpleNamespace(value="sparse"),
+                            remap_end=4096,
+                            source_lease=None,
+                        )
                     }
                 ),
                 num_reqs=1,

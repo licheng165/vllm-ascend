@@ -4,9 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
-from vllm.v1.core.sched.dsa_types import DSARouteState
+from vllm.v1.core.sched.dsa_types import (
+    DSAExecutionReceipt,
+    DSARouteState,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 
@@ -48,6 +51,7 @@ def test_long_decoder_completion_has_dsa_state_and_route() -> None:
         request_id="long-decoder-request",
         resumable=False,
         num_tokens=16384,
+        all_token_ids=list(range(16384)),
         dsa_state=None,
     )
 
@@ -74,6 +78,63 @@ def test_long_decoder_completion_has_dsa_state_and_route() -> None:
     )
 
     scheduler.kv_cache_manager.remove_saved_decode_window_blocks.assert_not_called()
-    pending_key, pending_frontiers = scheduler._dsa_pending_decode_window_releases[request.request_id]
-    assert pending_key == request.dsa_state.request_key
-    assert list(pending_frontiers) == [16384]
+    assert request.request_id not in scheduler._dsa_pending_decode_window_releases
+
+
+def test_recompute_scheduler_consumes_worker_execution_receipt() -> None:
+    scheduler = _make_scheduler()
+    request = SimpleNamespace(
+        request_id="receipt-request",
+        num_prompt_tokens=4,
+        num_tokens=5,
+        all_token_ids=[1, 2, 3, 4, 5],
+    )
+    state = scheduler.dsa_controller.initialize_state(
+        request.request_id,
+        num_tokens=request.num_tokens,
+    )
+    scheduler.dsa_controller.attach_state(state)
+    state.completed_canonical_end = 4
+    state.external_computed_end = 3
+    state.min_position_of_next_target_rows = 4
+    token_prefix_digest = scheduler.dsa_controller.compute_token_prefix_digest(
+        request.all_token_ids,
+        request.num_tokens,
+    )
+    scheduler.dsa_controller.build_route_snapshots(
+        [request.request_id],
+        {request.request_id: request.num_tokens},
+        scheduled_token_counts={request.request_id: 1},
+        execution_seq=3,
+        token_prefix_digests={
+            request.request_id: token_prefix_digest,
+        },
+    )
+    request.all_token_ids.append(6)
+    request.num_tokens = 6
+    receipt = DSAExecutionReceipt(
+        request_key=state.request_key,
+        execution_seq=3,
+        route_epoch=state.route_epoch,
+        accepted_end_at_execution=5,
+        completed_canonical_end=5,
+        external_computed_end=4,
+        initial_prefill_complete=True,
+        min_position_of_next_target_rows=5,
+        token_prefix_digest=token_prefix_digest,
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        dsa_execution_receipts={request.request_id: receipt},
+    )
+
+    scheduler._consume_dsa_execution_receipt(
+        model_runner_output,
+        request,
+    )
+
+    assert state.completed_canonical_end == 5
+    assert state.external_computed_end == 4
+    assert state.accepted_end == 6
+    assert state.initial_prefill_complete

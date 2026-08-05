@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.dsa_operation_registry import DSAOperationError
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
@@ -238,6 +239,10 @@ class RecomputeScheduler(Scheduler):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if self.dsa_controller.blocks_model_execution(request.request_id):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -793,6 +798,18 @@ class RecomputeScheduler(Scheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        dsa_execution_receipts = model_runner_output.dsa_execution_receipts
+        if self.dsa_controller.config.enabled:
+            expected_execution_receipts = set(num_scheduled_tokens)
+            actual_execution_receipts = set(dsa_execution_receipts)
+            if actual_execution_receipts != expected_execution_receipts:
+                missing = sorted(expected_execution_receipts - actual_execution_receipts)
+                unexpected = sorted(actual_execution_receipts - expected_execution_receipts)
+                raise DSAOperationError(
+                    f"DSA execution receipt set mismatch: missing={missing}, unexpected={unexpected}"
+                )
+            if set(scheduler_output.dsa_routes) != expected_execution_receipts:
+                raise DSAOperationError("positive-threshold model batch is missing DSA route snapshots")
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -890,6 +907,12 @@ class RecomputeScheduler(Scheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if self.dsa_controller.config.enabled:
+                self._consume_dsa_execution_receipt(
+                    model_runner_output,
+                    request,
+                )
+
             routed_experts = None
             finish_reason = None
             if stopped:
@@ -974,6 +997,13 @@ class RecomputeScheduler(Scheduler):
                     )
                 )
 
+        if kv_connector_output:
+            self._consume_dsa_connector_output(kv_connector_output)
+
+        for request in tuple(self.requests.values()):
+            if not request.is_finished():
+                self.dsa_controller.maybe_advance(request.request_id)
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(
@@ -1023,6 +1053,36 @@ class RecomputeScheduler(Scheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _consume_dsa_execution_receipt(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        request: Request,
+    ) -> None:
+        """Consume a worker receipt after this scheduler accepts its output."""
+        receipt = model_runner_output.dsa_execution_receipts.get(request.request_id)
+        if receipt is None:
+            raise DSAOperationError(
+                f"missing DSA execution receipt for {request.request_id}"
+            )
+        accepted_digest = self.dsa_controller.compute_token_prefix_digest(
+            list(request.all_token_ids),
+            request.num_tokens,
+        )
+        self.dsa_controller.consume_accepted_end(
+            request.request_id,
+            request.num_tokens,
+            accepted_digest,
+        )
+        completed_digest = self.dsa_controller.compute_token_prefix_digest(
+            list(request.all_token_ids),
+            receipt.completed_canonical_end,
+        )
+        self.dsa_controller.consume_completed_execution(
+            request.request_id,
+            receipt,
+            completed_digest,
+        )
 
 
 class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):
