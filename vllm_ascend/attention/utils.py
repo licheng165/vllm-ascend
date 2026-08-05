@@ -437,32 +437,41 @@ def staged_sfa_metadata_sparse_load(
         if req_id not in active_request_id_set:
             continue
         matched_request_ids.add(req_id)
-        load_spec = getattr(request, "load_spec", None)
-        if getattr(request, "is_sparse_decode", False):
-            if req_id in sparse_frontiers:
-                return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
-            sparse_frontiers[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None)
-                is not None
-                else (
-                    getattr(load_spec, "lmcache_cached_tokens", 0)
-                    if getattr(load_spec, "can_load", False)
-                    else 0
-                )
-                or 0
-            )
+        if not getattr(request, "is_sparse_decode", False):
             continue
-        # Dense fast-path request (is_sparse_decode=False): classify as a
-        # dense-prefix load regardless of can_load (the first decode step has
-        # can_load=False before the prefix is resident; treating it as
-        # SPARSE_LOAD_UNAVAILABLE would make the staged-SFA local route fatal
-        # across DP). Save-only metas (load_spec is None, e.g. a decode-window
-        # save sharing the same req_id as the main decode request) are NOT
-        # dense loads: classifying them here would collide with the main
-        # request's sparse frontier (DUPLICATE_SPARSE_LOAD).
-        if load_spec is not None:
-            dense_request_ids.add(req_id)
+        if req_id in sparse_frontiers:
+            return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
+        load_spec = getattr(request, "load_spec", None)
+        sparse_frontiers[req_id] = int(
+            getattr(load_spec, "dsa_committed_end", None)
+            if getattr(load_spec, "dsa_committed_end", None)
+            is not None
+            else (
+                getattr(load_spec, "lmcache_cached_tokens", 0)
+                if getattr(load_spec, "can_load", False)
+                else 0
+            )
+            or 0
+        )
+    for request in getattr(metadata, "requests", ()):
+        req_id = str(getattr(request, "req_id", ""))
+        if req_id not in active_request_id_set:
+            continue
+        if getattr(request, "is_sparse_decode", False):
+            continue
+        if req_id in sparse_frontiers:
+            # Save-only meta (decode-window save) sharing the main request's
+            # req_id: never a dense load (would collide with the sparse
+            # frontier, DUPLICATE_SPARSE_LOAD).
+            continue
+        # Dense fast-path request (is_sparse_decode=False): the whole prefix
+        # is resident, so it is a dense-prefix hit whether or not a load spec
+        # is still carried. The steady state strips the spec after the first
+        # scheduled step (load_spec=None); classifying it dense keeps the
+        # staged-SFA route on the captured graph instead of the eager
+        # fallback. The transfer phase (load spec present) is distinguished
+        # by the route's load-transfer guard.
+        dense_request_ids.add(req_id)
 
     if dense_request_ids.intersection(sparse_frontiers):
         return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()

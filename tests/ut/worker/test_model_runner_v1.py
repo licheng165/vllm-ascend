@@ -709,6 +709,18 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=False,
+                                load_spec=None,
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                },
+                "dense_prefix_hit_loading": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=False,
                                 load_spec=SimpleNamespace(can_load=True),
                             )
                             for req_id in request_ids
@@ -751,10 +763,11 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 with self.subTest(name=name):
                     route = runner._staged_sfa_local_route(**rejected)
                     if name == "dense_prefix_hit":
-                        # 方案 A dense fast-path: the whole prefix is resident,
-                        # so the step is staged with zero frontiers (no
-                        # compact-scratch remap) instead of the eager native
-                        # fallback, keeping both DPs on the captured graph.
+                        # 方案 A dense fast-path steady state: the whole prefix
+                        # is resident (no load spec), so the step is staged
+                        # with zero frontiers (no compact-scratch remap)
+                        # instead of the eager native fallback, keeping both
+                        # DPs on the captured graph.
                         self.assertEqual(
                             route.action,
                             StagedSFARouteAction.STAGED,
@@ -764,6 +777,19 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             StagedSFARouteReason.DENSE_PREFIX_HIT,
                         )
                         self.assertEqual(route.frontiers, (0,) * 4)
+                        continue
+                    if name == "dense_prefix_hit_loading":
+                        # Transfer phase: a load spec is still carried, so the
+                        # step stays eager (the per-layer connector waits
+                        # perform the KV transfer).
+                        self.assertEqual(
+                            route.action,
+                            StagedSFARouteAction.SAFE_NATIVE,
+                        )
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.DENSE_PREFIX_HIT,
+                        )
                         continue
                     self.assertEqual(
                         route.action,
@@ -811,7 +837,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(route.reason, StagedSFARouteReason.NOT_DECODE)
 
     def test_dense_prefix_hit_is_staged_with_zero_frontiers(self):
-        """Regression: 0804-5. With 方案 A, a within-threshold request is
+        """Regression: 0805-1. With 方案 A, a within-threshold request is
         is_sparse_decode=False and its whole prefix is resident, so the step
         must run through the captured staged graph with zero frontiers (no
         compact-scratch remap). Routing it to the eager native path instead
@@ -828,13 +854,12 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "request_ids": request_ids,
             "kv_connector_metadata": SimpleNamespace(
                 requests=[
+                    # Steady state: the prefix is resident and the load spec
+                    # has been stripped (load_spec=None).
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=False,
-                        load_spec=SimpleNamespace(
-                            can_load=True,
-                            lmcache_cached_tokens=4096,
-                        ),
+                        load_spec=None,
                     )
                     for req_id in request_ids
                 ]
@@ -875,29 +900,35 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(live_route.graph_key, StagedSFAGraphKey.exact_q1(4))
             self.assertEqual(live_route.frontiers, (0,) * 4)
 
-            # First decode step: the prefix load is still in flight
-            # (can_load=False), so the step must stay on the eager native
-            # path where the per-layer connector waits perform the transfer.
-            loading_kwargs = dict(local_kwargs)
-            loading_kwargs["kv_connector_metadata"] = SimpleNamespace(
-                requests=[
-                    SimpleNamespace(
-                        req_id=req_id,
-                        is_sparse_decode=False,
-                        load_spec=SimpleNamespace(can_load=False),
+            # First decode step: the prefix transfer is still in flight (a
+            # load spec is carried), so the step must stay on the eager native
+            # path where the per-layer connector waits perform the transfer —
+            # regardless of can_load (can_load=True only means the retrieval
+            # was set up, not that the KV is resident yet).
+            for can_load in (False, True):
+                loading_kwargs = dict(local_kwargs)
+                loading_kwargs["kv_connector_metadata"] = SimpleNamespace(
+                    requests=[
+                        SimpleNamespace(
+                            req_id=req_id,
+                            is_sparse_decode=False,
+                            load_spec=SimpleNamespace(can_load=can_load),
+                        )
+                        for req_id in request_ids
+                    ]
+                )
+                with self.subTest(can_load=can_load):
+                    loading_route = runner._staged_sfa_local_route(
+                        **loading_kwargs
                     )
-                    for req_id in request_ids
-                ]
-            )
-            loading_route = runner._staged_sfa_local_route(**loading_kwargs)
-            self.assertEqual(
-                loading_route.action,
-                StagedSFARouteAction.SAFE_NATIVE,
-            )
-            self.assertEqual(
-                loading_route.reason,
-                StagedSFARouteReason.DENSE_PREFIX_HIT,
-            )
+                    self.assertEqual(
+                        loading_route.action,
+                        StagedSFARouteAction.SAFE_NATIVE,
+                    )
+                    self.assertEqual(
+                        loading_route.reason,
+                        StagedSFARouteReason.DENSE_PREFIX_HIT,
+                    )
 
     def test_missing_or_unavailable_connector_metadata_falls_back_native(
         self,

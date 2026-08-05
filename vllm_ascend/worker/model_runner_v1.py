@@ -3032,18 +3032,16 @@ class NPUModelRunner(GPUModelRunner):
             # dummy off the graph via the route all-reduce, collapsing TPOT to
             # hundreds of milliseconds with single-digit NPU utilization.
             active_request_ids = {str(req_id) for req_id in request_ids}
-            prefix_resident = all(
-                bool(
-                    getattr(getattr(request, "load_spec", None), "can_load", False)
-                )
+            load_transfer_pending = any(
+                getattr(request, "load_spec", None) is not None
                 for request in getattr(kv_connector_metadata, "requests", ())
                 if str(getattr(request, "req_id", "")) in active_request_ids
             )
-            if not prefix_resident:
-                # First decode step: the prefix load is still in flight and
-                # the eager path's per-layer connector waits perform the KV
-                # transfer itself. Staged replay would see a zero payload and
-                # attend over blocks the load has not filled yet.
+            if load_transfer_pending:
+                # First decode step(s): the prefix transfer is still in flight
+                # and the eager path's per-layer connector waits perform the
+                # KV transfer itself. Staged replay would see a zero payload
+                # and attend over blocks the load has not filled yet.
                 return native(metadata_reason)
             return StagedSFARouteDecision(
                 StagedSFARouteAction.STAGED,

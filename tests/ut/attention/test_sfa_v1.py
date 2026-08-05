@@ -717,6 +717,64 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
         )
 
+    def test_dense_request_steady_state_without_load_spec_is_dense_prefix_hit(
+        self,
+    ):
+        """Regression: 0805-1. After the prefix transfer, the load spec is
+        stripped (load_spec=None) and the request stays is_sparse_decode=False.
+        It must classify as DENSE_PREFIX_HIT (so the route can stage the step
+        on the captured graph), not SPARSE_LOAD_UNAVAILABLE which kept every
+        step on the slow eager path."""
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="dense",
+                    is_sparse_decode=False,
+                    load_spec=None,
+                )
+            ]
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["dense"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+        )
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["dense"]),
+            [0],
+        )
+
+    def test_save_only_meta_of_dense_request_stays_dense_prefix_hit(self):
+        """A dense fast-path request with an accompanying decode-window
+        save-only meta (same req_id, load_spec=None) must still classify as
+        DENSE_PREFIX_HIT, order-independently."""
+        main = SimpleNamespace(
+            req_id="dense",
+            is_sparse_decode=False,
+            load_spec=None,
+        )
+        save_only = SimpleNamespace(
+            req_id="dense",
+            is_sparse_decode=False,
+            load_spec=None,
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                SimpleNamespace(requests=[main, save_only]),
+                ["dense"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                SimpleNamespace(requests=[save_only, main]),
+                ["dense"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+        )
+
     def test_sparse_request_with_save_only_meta_is_not_duplicate(self):
         """Regression: a long (sparse) request whose decode-window-save meta
         (load_spec=None, is_sparse_decode=False, same req_id) is emitted in the
