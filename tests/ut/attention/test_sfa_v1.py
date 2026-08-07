@@ -687,12 +687,28 @@ class TestLMCacheSparseFrontier(TestBase):
             ]
         )
 
+        # Regression: 0806-2. A mixed step must report the ordered per-row
+        # frontiers (0 for the dense fast-path row, the committed end for the
+        # sparse row) so the staged-SFA route can run the captured graph
+        # instead of the eager per-layer fallback.
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(
                 metadata,
                 ["dense", "sparse"],
             ),
-            (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()),
+            (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (0, 0)),
+        )
+        metadata.requests[1].load_spec = SimpleNamespace(
+            can_load=True,
+            lmcache_cached_tokens=8192,
+            dsa_committed_end=8192,
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["dense", "sparse"],
+            ),
+            (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (0, 8192)),
         )
 
     def test_dense_request_first_decode_step_is_dense_prefix_hit(self):

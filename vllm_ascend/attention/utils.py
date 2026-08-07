@@ -478,7 +478,13 @@ def staged_sfa_metadata_sparse_load(
     loadable_request_ids = dense_request_ids.union(sparse_frontiers)
     if loadable_request_ids == active_request_id_set:
         if dense_request_ids and sparse_frontiers:
-            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()
+            return (
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                tuple(
+                    sparse_frontiers.get(req_id, 0)
+                    for req_id in active_request_ids
+                ),
+            )
         if sparse_frontiers:
             return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
         return StagedSFARouteReason.DENSE_PREFIX_HIT, ()

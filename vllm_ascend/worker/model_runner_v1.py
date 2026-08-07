@@ -2968,6 +2968,28 @@ class NPUModelRunner(GPUModelRunner):
             return None
         return batch_size
 
+    def _staged_sfa_dense_load_transfer_pending(
+        self,
+        kv_connector_metadata: Any,
+        request_ids: Any,
+    ) -> bool:
+        """Whether any DENSE fast-path request still carries a load spec.
+
+        A load spec on a dense request means its prefix transfer is still in
+        flight: the eager path's per-layer connector waits perform the KV
+        transfer itself, while staged replay would see a zero payload and
+        attend over blocks the load has not filled yet. Sparse requests
+        rebuild a load spec every step as steady-state metadata, so they are
+        not counted.
+        """
+        active_request_ids = {str(req_id) for req_id in request_ids}
+        return any(
+            not getattr(request, "is_sparse_decode", False)
+            and getattr(request, "load_spec", None) is not None
+            for request in getattr(kv_connector_metadata, "requests", ())
+            if str(getattr(request, "req_id", "")) in active_request_ids
+        )
+
     def _staged_sfa_local_route(
         self,
         *,
@@ -3031,13 +3053,10 @@ class NPUModelRunner(GPUModelRunner):
             # sparse machinery per layer per step, and it drags the idle DP's
             # dummy off the graph via the route all-reduce, collapsing TPOT to
             # hundreds of milliseconds with single-digit NPU utilization.
-            active_request_ids = {str(req_id) for req_id in request_ids}
-            load_transfer_pending = any(
-                getattr(request, "load_spec", None) is not None
-                for request in getattr(kv_connector_metadata, "requests", ())
-                if str(getattr(request, "req_id", "")) in active_request_ids
-            )
-            if load_transfer_pending:
+            if self._staged_sfa_dense_load_transfer_pending(
+                kv_connector_metadata,
+                request_ids,
+            ):
                 # First decode step(s): the prefix transfer is still in flight
                 # and the eager path's per-layer connector waits perform the
                 # KV transfer itself. Staged replay would see a zero payload
@@ -3049,7 +3068,38 @@ class NPUModelRunner(GPUModelRunner):
                 frontiers=(0,) * num_reqs,
             )
         if metadata_reason == StagedSFARouteReason.MIXED_CONNECTOR_LOAD:
-            return native(metadata_reason)
+            # Mixed dense (short fast-path) + sparse (long) step: the staged
+            # graph supports per-row boundaries — split_boundary is a per-step
+            # input, dense rows get 0 and sparse rows their committed
+            # frontier. Run the step on the captured graph; the eager fallback
+            # would execute every layer as a separate fx-compiled subgraph and
+            # collapse the TPOT of the whole batch (and of the peer DP via the
+            # route all-reduce) until the short request finishes.
+            if self._staged_sfa_dense_load_transfer_pending(
+                kv_connector_metadata,
+                request_ids,
+            ):
+                # The dense member's prefix transfer is still in flight.
+                return native(metadata_reason)
+            if len(frontiers) != num_reqs:
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
+                )
+            scratch_capacity = query_width * index_topk
+            if any(
+                frontier != 0 and frontier < scratch_capacity
+                for frontier in frontiers
+            ):
+                return StagedSFARouteDecision(
+                    StagedSFARouteAction.FATAL,
+                    StagedSFARouteReason.FRONTIER_TOO_SHORT,
+                )
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.STAGED,
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                frontiers=frontiers,
+            )
         # Missing/unavailable connector metadata is NOT fatal: the dense
         # fast-path (方案 A) makes short requests is_sparse_decode=False, and a
         # short request whose metadata is absent (e.g. no load spec) must

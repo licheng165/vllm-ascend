@@ -742,6 +742,26 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         ]
                     ),
                 },
+                "mixed_connector_load_steady": {
+                    "kv_connector_metadata": SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=index >= 2,
+                                load_spec=(
+                                    None
+                                    if index < 2
+                                    else SimpleNamespace(
+                                        can_load=True,
+                                        lmcache_cached_tokens=8192,
+                                        dsa_committed_end=8192,
+                                    )
+                                ),
+                            )
+                            for index, req_id in enumerate(request_ids)
+                        ]
+                    ),
+                },
                 "short_frontier": {
                     "kv_connector_metadata": SimpleNamespace(
                         requests=[
@@ -789,6 +809,25 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         self.assertEqual(
                             route.reason,
                             StagedSFARouteReason.DENSE_PREFIX_HIT,
+                        )
+                        continue
+                    if name == "mixed_connector_load_steady":
+                        # Regression: 0806-2. Mixed long-sparse + short-dense
+                        # step whose dense member is resident (no load spec)
+                        # must run the captured graph with the per-row
+                        # frontiers (0 for dense, committed end for sparse)
+                        # instead of the eager fallback.
+                        self.assertEqual(
+                            route.action,
+                            StagedSFARouteAction.STAGED,
+                        )
+                        self.assertEqual(
+                            route.reason,
+                            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                        )
+                        self.assertEqual(
+                            route.frontiers,
+                            (0, 0, 8192, 8192),
                         )
                         continue
                     self.assertEqual(
