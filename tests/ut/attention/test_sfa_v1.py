@@ -483,6 +483,39 @@ class TestDSADenseFastPathRows(TestBase):
             )
         )
 
+    def test_dense_per_row_seq_lens_expands_multi_request_mtp_batches(self):
+        """Regression: 0807-3. The dense MLA kernel's TND spec-decode branch
+        requires actual_seq_qlen[-1] == T (single-request steps only), so
+        multi-request MTP steps fall back to the BNSD layout which needs one
+        KV length per query row. A main MTP decode batch (decode_threshold rows
+        per request) repeats each request's length; a draft batch (one row per
+        request) is already per-row."""
+        # Single-request steps stay per-request (TND branch handles them).
+        self.assertEqual(
+            sfa_v1._dsa_dense_per_row_seq_lens([8378], [2], 2),
+            [8378],
+        )
+        self.assertEqual(
+            sfa_v1._dsa_dense_per_row_seq_lens([8379], [1], 2),
+            [8379],
+        )
+        # Main MTP decode with two requests: two rows per request share the
+        # request's KV length.
+        self.assertEqual(
+            sfa_v1._dsa_dense_per_row_seq_lens([8378, 8378], [2, 2], 2),
+            [8378, 8378, 8378, 8378],
+        )
+        # MTP draft batch: one row per request — already per-row.
+        self.assertEqual(
+            sfa_v1._dsa_dense_per_row_seq_lens([8379, 8379], [1, 1], 2),
+            [8379, 8379],
+        )
+        # Non-MTP: unchanged.
+        self.assertEqual(
+            sfa_v1._dsa_dense_per_row_seq_lens([8378, 8378], [1, 1], 1),
+            [8378, 8378],
+        )
+
 
 class TestLMCacheSparseFrontier(TestBase):
     @staticmethod

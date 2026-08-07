@@ -755,6 +755,29 @@ def _dsa_apply_identity_rows(
     return topk_2d
 
 
+def _dsa_dense_per_row_seq_lens(
+    seq_lens: list[int],
+    query_lens: list[int],
+    decode_threshold: int,
+) -> list[int]:
+    """Expand per-request KV lengths to one value per dense query row.
+
+    The dense MLA kernel's BNSD fallback needs one ``actual_seq_kvlen`` per
+    query row. A main MTP decode batch carries ``decode_threshold`` query rows
+    per request sharing the request's KV length, so each request's length is
+    repeated; a draft batch (one row per request) is already per-row.
+    """
+    if (
+        decode_threshold > 1
+        and len(query_lens) > 1
+        and sum(query_lens) == len(query_lens) * decode_threshold
+    ):
+        return [
+            seq_len for seq_len in seq_lens for _ in range(decode_threshold)
+        ]
+    return list(seq_lens)
+
+
 def _dsa_build_target_slot_mapping(
     block_table: torch.Tensor,
     row_req_indices: torch.Tensor,
@@ -1524,7 +1547,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 _dsa_dense_query_lens = query_start_loc_cpu[
                     1 : num_reqs + 1
                 ].tolist()
-                _dsa_dense_seq_lens = seq_lens_cpu.tolist()
+                _dsa_dense_seq_lens = _dsa_dense_per_row_seq_lens(
+                    seq_lens_cpu.tolist(),
+                    _dsa_dense_query_lens,
+                    self.decode_threshold,
+                )
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -2635,8 +2662,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         k_nope = kv_cache[0].view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
         k_pe = kv_cache[1].view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
         # Spec-decode (MTP) iff decode_threshold > 1
-        # (decode_threshold = 1 + num_speculative_tokens).
-        if self.decode_threshold > 1:
+        # (decode_threshold = 1 + num_speculative_tokens). The TND_NTD branch
+        # mirrors mla_v1's spec-decode invocation, but the kernel requires
+        # actual_seq_qlen[-1] == T, which only holds for single-request steps
+        # (one request's rows cover all T query tokens). Multi-request steps —
+        # the main MTP decode batch (decode_threshold rows per request) and the
+        # MTP draft batch (one row per request) — use the BNSD_NBSD fallback
+        # with one KV length per query row instead.
+        num_reqs = len(attn_metadata.dsa_dense_query_lens)
+        if self.decode_threshold > 1 and num_reqs == 1:
             # Mirrors mla_v1's spec-decode branch: TND query, NTD output
             # (num_heads, num_tokens, kv_lora_rank).
             q_nope = ql_nope.view(num_tokens, self.num_heads, -1).contiguous()
