@@ -1539,11 +1539,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 AscendAttentionState.SpecDecoding,
             )
         ):
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
             _dsa_dense_decode = bool(
                 int(seq_lens_cpu.max()) <= self.dsa_dense_threshold
+                # The dense MLA kernel processes every query row it receives
+                # and requires actual_seq_qlen[-1] == T in TND mode, so it
+                # cannot absorb padding rows. Steps whose processed token
+                # count exceeds the real query total (e.g. the MTP draft batch
+                # padded from 1 to the 2-row capture capacity, or any
+                # graph-padded decode) keep the sparse path, which handles
+                # padding rows natively.
+                and int(query_start_loc_cpu[num_reqs]) == num_input_tokens
             )
             if _dsa_dense_decode:
-                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
                 _dsa_dense_query_lens = query_start_loc_cpu[
                     1 : num_reqs + 1
                 ].tolist()
