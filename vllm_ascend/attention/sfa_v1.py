@@ -727,57 +727,6 @@ def _dsa_mask_padding_sparse_rows(
     return topk_indices, topk_2d
 
 
-def _dsa_apply_identity_rows(
-    topk_indices: torch.Tensor,
-    short_rows: torch.Tensor,
-    index_topk: int,
-) -> torch.Tensor:
-    """Overwrite short rows' sparse selection with identity (all-token) indices.
-
-    Used by the mixed-batch dense fast-path: rows whose request context is
-    within the dense threshold attend over ALL their tokens (exactly dense
-    attention) while long rows keep the indexer selection. `short_rows` is a
-    device boolean mask over decode rows (True = short). The overwritten rows
-    use 0..seq_len-1 as the sparse indices; the sparse FA kernel bounds each
-    row by its own actual_seq_lengths_key, so positions past seq_len are
-    ignored and the remaining topk padding is filled with 0 (always valid).
-    """
-    topk_2d = _dsa_topk_to_2d_indices(topk_indices)
-    num_rows = int(topk_2d.shape[0])
-    if num_rows == 0 or index_topk <= 0:
-        return topk_indices
-    short_rows = short_rows[:num_rows].to(device=topk_2d.device)
-    base = torch.arange(index_topk, dtype=topk_2d.dtype, device=topk_2d.device)
-    base = base.reshape(1, -1).expand(num_rows, index_topk)
-    topk_2d = torch.where(short_rows.reshape(-1, 1), base, topk_2d)
-    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
-        return topk_2d.unsqueeze(1)
-    return topk_2d
-
-
-def _dsa_dense_per_row_seq_lens(
-    seq_lens: list[int],
-    query_lens: list[int],
-    decode_threshold: int,
-) -> list[int]:
-    """Expand per-request KV lengths to one value per dense query row.
-
-    The dense MLA kernel's BNSD fallback needs one ``actual_seq_kvlen`` per
-    query row. A main MTP decode batch carries ``decode_threshold`` query rows
-    per request sharing the request's KV length, so each request's length is
-    repeated; a draft batch (one row per request) is already per-row.
-    """
-    if (
-        decode_threshold > 1
-        and len(query_lens) > 1
-        and sum(query_lens) == len(query_lens) * decode_threshold
-    ):
-        return [
-            seq_len for seq_len in seq_lens for _ in range(decode_threshold)
-        ]
-    return list(seq_lens)
-
-
 def _dsa_build_target_slot_mapping(
     block_table: torch.Tensor,
     row_req_indices: torch.Tensor,
@@ -962,25 +911,6 @@ class AscendSFAMetadata:
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
 
-    # Short-context dense fast-path: set once per step by the builder when
-    # every decode request's seq_len is within the dense threshold. The SFA
-    # forward then skips the lightning indexer and runs the dense MLA attention
-    # kernel over the resident paged latent.
-    dsa_dense_decode: bool = False
-    # Per-request cumulative query lengths and per-request KV lengths (CPU
-    # lists) for the dense fast-path kernel call. Built once per step.
-    dsa_dense_query_lens: list[int] | None = None
-    dsa_dense_seq_lens: list[int] | None = None
-    # Per-row boolean mask (device, over decode rows) marking rows whose
-    # request context is within the dense threshold in a MIXED batch. The SFA
-    # forward overwrites those rows' indexer selection with identity (all
-    # token) indices, guaranteeing dense semantics for short rows while long
-    # rows keep the sparse path. None for pure-short or all-long steps.
-    dsa_dense_rows: torch.Tensor | None = None
-    # Diagnostics (VLLM_ASCEND_DSA_DENSE_PATH_LOG): set once per step so the
-    # per-layer forward logs the dense/sparse path decision only once.
-    dsa_dense_path_logged: bool = False
-
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 
@@ -1049,18 +979,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
         self._dsa_target_position_offsets = (
             torch.arange(self.index_topk, dtype=torch.long, device=device) if self.dsa_shrink_latent else None
-        )
-
-        # Short-context dense fast-path threshold (tokens). Decode steps whose
-        # every request's seq_len is no larger than this threshold take the
-        # dense path (dense MLA attention kernel over the resident paged latent
-        # instead of the lightning indexer + sparse FA). 0 (default) disables
-        # the dense fast-path entirely (pure sparse path); a positive value is
-        # used as-is (no cap), so a value larger than index_topk forces dense
-        # attention for contexts beyond the sparse-equivalent range.
-        raw_dense_threshold = envs.VLLM_ASCEND_DSA_DENSE_THRESHOLD
-        self.dsa_dense_threshold = (
-            raw_dense_threshold if raw_dense_threshold > 0 else 0
         )
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -1513,54 +1431,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
 
-        # Short-context dense fast-path: a pure decode step whose every request
-        # has seq_len <= dsa_dense_threshold skips the lightning indexer and the
-        # sparse machinery in the SFA forward, running dense attention over the
-        # resident paged latent instead. Sparse selection over a context no
-        # longer than index_topk is mathematically identical to dense attention,
-        # so this is exact. Computed once per step (not per layer).
-        _dsa_dense_decode = False
-        _dsa_dense_query_lens: list[int] | None = None
-        _dsa_dense_seq_lens: list[int] | None = None
-        _dsa_dense_rows: torch.Tensor | None = None
-        # The staged SFA graph (D-node PIECEWISE) routes/captures the sparse
-        # path; disable the dense fast-path there (forward also enforces this).
-        _dsa_dense_disabled = (
-            self.enable_dsa_cp or staged_sfa_graph_configured(self.vllm_config)
-        )
-        if (
-            not _dsa_dense_disabled
-            and self.dsa_dense_threshold > 0
-            and seq_lens_cpu is not None
-            and seq_lens_cpu.numel() > 0
-            and common_attn_metadata.attn_state
-            in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            )
-        ):
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-            _dsa_dense_decode = bool(
-                int(seq_lens_cpu.max()) <= self.dsa_dense_threshold
-                # The dense MLA kernel processes every query row it receives
-                # and requires actual_seq_qlen[-1] == T in TND mode, so it
-                # cannot absorb padding rows. Steps whose processed token
-                # count exceeds the real query total (e.g. the MTP draft batch
-                # padded from 1 to the 2-row capture capacity, or any
-                # graph-padded decode) keep the sparse path, which handles
-                # padding rows natively.
-                and int(query_start_loc_cpu[num_reqs]) == num_input_tokens
-            )
-            if _dsa_dense_decode:
-                _dsa_dense_query_lens = query_start_loc_cpu[
-                    1 : num_reqs + 1
-                ].tolist()
-                _dsa_dense_seq_lens = _dsa_dense_per_row_seq_lens(
-                    seq_lens_cpu.tolist(),
-                    _dsa_dense_query_lens,
-                    self.decode_threshold,
-                )
-
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
@@ -1642,43 +1512,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
 
-        # Mixed-batch dense fast-path: when only SOME decode rows belong to
-        # short requests (and the step is not pure-short), the SFA forward
-        # overwrites those rows' indexer selection with identity (all-token)
-        # indices so short rows get exact dense semantics while long rows keep
-        # the sparse path. Requires the shrink-latent row -> request mapping.
-        if (
-            not _dsa_dense_decode
-            and not _dsa_dense_disabled
-            and self.dsa_dense_threshold > 0
-            and seq_lens_cpu is not None
-            and seq_lens_cpu.numel() > 0
-            and decode_req_indices_cpu is not None
-            and common_attn_metadata.attn_state
-            in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            )
-        ):
-            req_indices_np = np.asarray(decode_req_indices_cpu).reshape(-1)
-            seq_lens_np = np.asarray(seq_lens_cpu).reshape(-1)
-            valid_rows = req_indices_np >= 0
-            if valid_rows.any():
-                row_seq = np.where(
-                    valid_rows,
-                    np.where(
-                        req_indices_np < len(seq_lens_np),
-                        seq_lens_np[req_indices_np.clip(min=0)],
-                        0,
-                    ),
-                    0,
-                )
-                short_rows = valid_rows & (row_seq <= self.dsa_dense_threshold)
-                if short_rows.any() and not bool(short_rows.all()):
-                    _dsa_dense_rows = torch.from_numpy(
-                        short_rows.astype(np.bool_)
-                    ).to(device=self.device)
-
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
@@ -1726,10 +1559,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
             decode_remap_boundary_ready=False,
             num_decode_tokens=num_decode_rows,
-            dsa_dense_decode=_dsa_dense_decode,
-            dsa_dense_query_lens=_dsa_dense_query_lens,
-            dsa_dense_seq_lens=_dsa_dense_seq_lens,
-            dsa_dense_rows=_dsa_dense_rows,
         )
 
     def build_for_graph_capture(
@@ -1861,21 +1690,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={self.decode_threshold}"
             )
-        # Short-context dense fast-path threshold (tokens). Decode steps whose
-        # every request's seq_len is no larger than this threshold take the
-        # dense path (dense MLA attention kernel over the resident paged latent
-        # instead of the lightning indexer + sparse FA). 0 (default) disables
-        # the dense fast-path entirely (pure sparse path); a positive value is
-        # used as-is (no cap), so a value larger than index_topk forces dense
-        # attention for contexts beyond the sparse-equivalent range.
-        raw_dense_threshold = envs.VLLM_ASCEND_DSA_DENSE_THRESHOLD
-        self.dsa_dense_threshold = (
-            raw_dense_threshold if raw_dense_threshold > 0 else 0
-        )
-        # Per-step dense-path logging (VLLM_ASCEND_DSA_DENSE_PATH_LOG).
-        self._dsa_dense_path_log = bool(envs.VLLM_ASCEND_DSA_DENSE_PATH_LOG)
-        self._dsa_dense_path_prev: bool | None = None
-        self._dsa_dense_path_prev_reqs: set[str] = set()
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
@@ -2567,164 +2381,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             sparse_mode=3,
         )
         return attn_output
-
-    def _log_dsa_dense_decode_step(
-        self,
-        attn_metadata: M,
-        dense_decode: bool,
-    ) -> None:
-        """Log the dense-vs-sparse attention path for the current decode step.
-
-        "dense"  = pure-short batch running the dense MLA kernel
-                   (dsa_dense_decode=True);
-        "sparse" = DSA sparse attention path.
-        forward() is called per layer; the metadata object is shared across
-        layers within one step, so log only once per step (first layer that
-        observes the decision) and only on path transitions.
-        """
-        if getattr(attn_metadata, "dsa_dense_path_logged", False):
-            return
-        attn_metadata.dsa_dense_path_logged = True
-        prev = self._dsa_dense_path_prev
-        if prev == dense_decode:
-            return
-        self._dsa_dense_path_prev = dense_decode
-        req_ids = list(attn_metadata.req_ids) if attn_metadata.req_ids else []
-        logger.info(
-            "[DSA_DENSE_PATH] attention=%s reqs=%s threshold=%d%s",
-            "dense" if dense_decode else "sparse",
-            req_ids[:8],
-            self.dsa_dense_threshold,
-            "" if prev is None else f" (switched from {'dense' if prev else 'sparse'})",
-        )
-
-    def _log_dsa_dense_mixed_rows(
-        self,
-        attn_metadata: M,
-        dense_rows: torch.Tensor,
-    ) -> None:
-        """Log per-request path in a mixed batch (dense rows -> identity
-        indices, sparse rows -> indexer selection). Logs once per step and only
-        for requests whose path changed."""
-        if getattr(attn_metadata, "dsa_dense_path_logged", False):
-            return
-        attn_metadata.dsa_dense_path_logged = True
-        req_ids = list(attn_metadata.req_ids) if attn_metadata.req_ids else []
-        if not req_ids:
-            return
-        row_req = getattr(attn_metadata, "decode_req_indices_cpu", None)
-        if row_req is None:
-            return
-        dense_bool = dense_rows.detach().cpu().numpy().reshape(-1)
-        row_req_np = np.asarray(row_req).reshape(-1)
-        dense_reqs = set()
-        sparse_reqs = set()
-        for row, req_idx in enumerate(row_req_np):
-            if row >= len(dense_bool) or int(req_idx) < 0:
-                continue
-            if int(req_idx) >= len(req_ids):
-                continue
-            target = dense_reqs if bool(dense_bool[row]) else sparse_reqs
-            target.add(req_ids[int(req_idx)])
-        # Prune finished requests from the transition tracker.
-        active = dense_reqs | sparse_reqs
-        self._dsa_dense_path_prev_reqs.intersection_update(active)
-        for req_id in dense_reqs:
-            if req_id in self._dsa_dense_path_prev_reqs:
-                continue
-            self._dsa_dense_path_prev_reqs.add(req_id)
-            logger.info(
-                "[DSA_DENSE_PATH] req=%s row_path=dense (identity indices)",
-                req_id,
-            )
-        for req_id in sparse_reqs:
-            if req_id not in self._dsa_dense_path_prev_reqs:
-                continue
-            self._dsa_dense_path_prev_reqs.discard(req_id)
-            logger.info(
-                "[DSA_DENSE_PATH] req=%s row_path=sparse (indexer selection)",
-                req_id,
-            )
-
-    def _execute_dense_decode_attention(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: M,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense MLA decode attention over the resident paged latent.
-
-        Used by the short-context dense fast-path (every decode request's
-        seq_len <= dsa_dense_threshold). Sparse selection over a context no
-        longer than index_topk is mathematically identical to dense attention,
-        so this replaces the lightning indexer + sparse FA with the dense MLA
-        kernel. Mirrors mla_v1's decode FIA v2 (TND_NTD) invocation: the paged
-        latent caches (k_nope in kv_cache[0], k_pe in kv_cache[1]) are passed
-        as key/key_rope with the request block table and per-request lengths.
-        """
-        num_tokens = int(ql_nope.shape[0])
-        block_size = self.block_size
-        k_nope = kv_cache[0].view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
-        k_pe = kv_cache[1].view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
-        # Spec-decode (MTP) iff decode_threshold > 1
-        # (decode_threshold = 1 + num_speculative_tokens). The TND_NTD branch
-        # mirrors mla_v1's spec-decode invocation, but the kernel requires
-        # actual_seq_qlen[-1] == T, which only holds for single-request steps
-        # (one request's rows cover all T query tokens). Multi-request steps —
-        # the main MTP decode batch (decode_threshold rows per request) and the
-        # MTP draft batch (one row per request) — use the BNSD_NBSD fallback
-        # with one KV length per query row instead.
-        num_reqs = len(attn_metadata.dsa_dense_query_lens)
-        if self.decode_threshold > 1 and num_reqs == 1:
-            # Mirrors mla_v1's spec-decode branch: TND query, NTD output
-            # (num_heads, num_tokens, kv_lora_rank).
-            q_nope = ql_nope.view(num_tokens, self.num_heads, -1).contiguous()
-            q_pe = q_pe.view(num_tokens, self.num_heads, -1).contiguous()
-            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                q_nope,
-                k_nope,
-                k_nope,
-                query_rope=q_pe,
-                key_rope=k_pe,
-                num_query_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="TND_NTD",
-                atten_mask=attn_metadata.attn_mask,
-                sparse_mode=3,
-                softmax_scale=self.scale,
-                block_table=attn_metadata.block_table,
-                block_size=block_size,
-                actual_seq_qlen=attn_metadata.dsa_dense_query_lens,
-                actual_seq_kvlen=attn_metadata.dsa_dense_seq_lens,
-            )
-            # SFA's _v_up_proj expects TND order: (num_tokens, num_heads, dim).
-            return attn_output.transpose(0, 1).contiguous()
-
-        # Non-spec decode: mirrors mla_v1's BNSD_NBSD branch; output is
-        # (num_heads, num_tokens, 1, kv_lora_rank).
-        q_nope = ql_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
-        q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1).contiguous()
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-            q_nope,
-            k_nope,
-            k_nope,
-            query_rope=q_pe,
-            key_rope=k_pe,
-            num_query_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="BNSD_NBSD",
-            atten_mask=None,
-            sparse_mode=0,
-            softmax_scale=self.scale,
-            block_table=attn_metadata.block_table,
-            block_size=block_size,
-            actual_seq_qlen=None,
-            actual_seq_kvlen=attn_metadata.dsa_dense_seq_lens,
-        )
-        return attn_output.transpose(0, 1).squeeze(2).contiguous()
 
     def _cross_layer_ineligible_reason(
         self,
@@ -3540,27 +3196,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
-        # Short-context dense fast-path: when every decode request's seq_len is
-        # within the dense threshold, skip the lightning indexer and the sparse
-        # machinery, running the dense MLA attention kernel over the resident
-        # paged latent instead. The builder computes the flag once per step.
-        _dsa_dense_decode = bool(getattr(attn_metadata, "dsa_dense_decode", False))
-        if _dsa_dense_decode and (
-            self.use_sparse_c8_indexer
-            or self.enable_staged_sfa_graph
-            or (
-                self.enable_mlapo
-                and attn_metadata.num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
-            )
-        ):
-            # The staged SFA graph (PIECEWISE, D-node) routes and captures the
-            # sparse path; its per-layer callbacks (cross_layer_graph_pre /
-            # remap / union buffers) assume sparse machinery. Disable the dense
-            # attention kernel there so staged graphs are unaffected; the dense
-            # LOAD path (LMCache) and dense TRANSFER (connector) still apply.
-            _dsa_dense_decode = False
-        if self._dsa_dense_path_log and _is_pure_decode:
-            self._log_dsa_dense_decode_step(attn_metadata, _dsa_dense_decode)
         _sparse_indices_padding_zeroed = False
         index_layer_name = _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
         index_lmcache_enabled = (
@@ -3649,14 +3284,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             # the post-indexer call (with selected_tokens). Calling here too
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
-            # batch has decode rows (mixed steps included). The dense fast-path
-            # never reaches the post-indexer sparse call, so it MUST use this
-            # dense layerwise load (drives the connector's dense retrieve).
-            if not (
-                self.dsa_shrink_latent
-                and attn_metadata.num_decode_tokens > 0
-                and not _dsa_dense_decode
-            ):
+            # batch has decode rows (mixed steps included).
+            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -3771,10 +3400,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if index_lmcache_enabled:
                 # A cold shared-cache decode needs prompt index rows before
                 # top-k selection. The group-1 wait is a no-op when resident
-                # and does not advance the group-0 latent-layer cursor. The
-                # dense fast-path MUST also keep this wait: two-group dense
-                # retrievers require BOTH wait groups before the layer cursor
-                # advances (_layerwise_wait_should_advance).
+                # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
 
@@ -3795,38 +3421,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         with _dsa_prof.section("indexer"):
-            if _dsa_dense_decode:
-                # Dense fast-path: skip the lightning indexer selection; the
-                # dense attention kernel below attends over the full resident
-                # latent (sparse selection over a context no longer than
-                # index_topk is identical to dense). The indexer key cache
-                # above is still written so a request that grows past the
-                # threshold can switch back to the sparse path seamlessly.
-                topk_indices = None
-            else:
-                topk_indices = self.indexer_select_post_process(
-                    x=hidden_states,
-                    q_c=q_c,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    cos=cos,
-                    sin=sin,
-                    actual_seq_lengths_query=actual_seq_lengths_query,
-                    actual_seq_lengths_key=actual_seq_lengths_key,
-                )
-                # Mixed-batch dense fast-path: overwrite short rows' indexer
-                # selection with identity (all-token) indices so short rows get
-                # exact dense semantics while long rows keep the sparse path.
-                # No-op when the step has no short rows (mask is None).
-                _dsa_dense_rows = getattr(attn_metadata, "dsa_dense_rows", None)
-                if self._dsa_dense_path_log and _dsa_dense_rows is not None:
-                    self._log_dsa_dense_mixed_rows(attn_metadata, _dsa_dense_rows)
-                if _dsa_dense_rows is not None:
-                    topk_indices = _dsa_apply_identity_rows(
-                        topk_indices,
-                        _dsa_dense_rows,
-                        self.index_topk,
-                    )
+            topk_indices = self.indexer_select_post_process(
+                x=hidden_states,
+                q_c=q_c,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                cos=cos,
+                sin=sin,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+            )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)
@@ -3836,10 +3440,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # block table. Decode-window mode uses current_window_start as the
         # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
-        # The dense fast-path skips this whole remap + sparse-load machinery.
         if (
-            not _dsa_dense_decode
-            and self.dsa_shrink_latent
+            self.dsa_shrink_latent
             and attn_metadata.split_boundary is not None
             and attn_metadata.num_decode_tokens > 0
             and (attn_metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
@@ -4346,7 +3948,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
-        if _adapter_supported and not _dsa_dense_decode:
+        if _adapter_supported:
             # Adapter-backed latent hot cache: FA reads the resident pool in place
             # (zero-copy), the adapter owns residency (hit/miss) + eviction.
             _ac = _dsa_adapter
@@ -4425,7 +4027,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _ctx_a = attn_metadata.seq_lens - (_qsl_a[1:] - _qsl_a[:-1])
                 _ac.store_prefill(layer_name, _req_ids_a, _qsl_a, _ctx_a, _kn_a, _kp_a)
 
-        if attn_output is None and _dsa_supported and not _dsa_dense_decode:
+        if attn_output is None and _dsa_supported:
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
 
             _block_size = kv_cache[0].shape[1]
@@ -4533,30 +4135,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = pool_out
 
         if attn_output is None:
-            if _dsa_dense_decode:
-                with _dsa_prof.section("fa_dense"):
-                    attn_output = self._execute_dense_decode_attention(
-                        ql_nope,
-                        q_pe,
-                        kv_cache,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                    )
-            else:
-                with _dsa_prof.section("fa"):
-                    attn_output = self._execute_sparse_flash_attention_process(
-                        ql_nope,
-                        q_pe,
-                        kv_cache,
-                        topk_indices,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="native",
-                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
-                    )
+            with _dsa_prof.section("fa"):
+                attn_output = self._execute_sparse_flash_attention_process(
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key,
+                    layer_name=layer_name,
+                    trace_label="native",
+                    padding_rows_zeroed=_sparse_indices_padding_zeroed,
+                )
             # one step per layer-call on the native (user) path so the profiler
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()

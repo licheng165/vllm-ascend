@@ -152,19 +152,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
-    # Short-context dense fast-path threshold (tokens). Requests/rows whose
-    # sequence length does not exceed this threshold take the dense path
-    # (dense attention kernel / identity sparse indices / dense KV transfer)
-    # instead of the DSA sparse machinery, since sparse selection over a
-    # context no longer than index_topk is mathematically identical to dense
-    # attention. 0 (default) disables the dense fast-path (pure sparse path);
-    # a positive value is used as-is (no cap), so a value larger than index_topk
-    # forces dense attention for contexts beyond the sparse-equivalent range.
-    "VLLM_ASCEND_DSA_DENSE_THRESHOLD": lambda: int(os.getenv("VLLM_ASCEND_DSA_DENSE_THRESHOLD", "0")),
-    # Log the dense-vs-sparse fast-path choice per request. When 1, log once per
-    # request whenever its decode path (re)enters or switches between the dense
-    # fast-path and the DSA sparse path. Default 0 (no logging).
-    "VLLM_ASCEND_DSA_DENSE_PATH_LOG": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_DENSE_PATH_LOG", "0"))),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.
