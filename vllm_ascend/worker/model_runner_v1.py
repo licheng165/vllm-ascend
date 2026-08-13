@@ -2985,6 +2985,7 @@ class NPUModelRunner(GPUModelRunner):
         active_request_ids = {str(req_id) for req_id in request_ids}
         return any(
             not getattr(request, "is_sparse_decode", False)
+            and not getattr(request, "is_decode_window_save", False)
             and getattr(request, "load_spec", None) is not None
             for request in getattr(kv_connector_metadata, "requests", ())
             if str(getattr(request, "req_id", "")) in active_request_ids
@@ -3007,15 +3008,9 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
             )
-        if not self._staged_sfa_graph_capture_sizes:
-            return native(StagedSFARouteReason.NOT_CONFIGURED)
-        if getattr(self, "calculate_kv_scales", False):
-            return native(StagedSFARouteReason.RUNTIME_MODE)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
-        if getattr(self.vllm_config, "lora_config", None) is not None:
-            return native(StagedSFARouteReason.LORA)
         expected_state = (
             AscendAttentionState.DecodeOnly
             if query_width == 1
@@ -3023,6 +3018,28 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.attn_state != expected_state:
             return native(StagedSFARouteReason.NOT_DECODE)
+        # Outside staged-SFA mode there is no compact graph route to protect;
+        # preserve the generic eager/native behavior. The eager attention
+        # remap resolver still validates the contract whenever it is used.
+        if not self._staged_sfa_graph_capture_sizes:
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
+            kv_connector_metadata,
+            request_ids,
+        )
+        if metadata_reason not in (
+            StagedSFARouteReason.ELIGIBLE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
+        if getattr(self, "calculate_kv_scales", False):
+            return native(StagedSFARouteReason.RUNTIME_MODE)
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return native(StagedSFARouteReason.LORA)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
@@ -3039,10 +3056,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
-        metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
-            kv_connector_metadata,
-            request_ids,
-        )
         if metadata_reason == StagedSFARouteReason.DENSE_PREFIX_HIT:
             # Short-context dense fast-path (方案 A): the whole prefix is
             # resident in the block table, so a zero frontier (no compact-
@@ -3100,17 +3113,6 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
                 frontiers=frontiers,
             )
-        # Missing/unavailable connector metadata is NOT fatal: the dense
-        # fast-path (方案 A) makes short requests is_sparse_decode=False, and a
-        # short request whose metadata is absent (e.g. no load spec) must
-        # simply fall back to native attention rather than kill the step.
-        # These reasons are also reached transiently (async lookup, decode
-        # window save-only metas), so failing closed would crash valid steps.
-        if metadata_reason in (
-            StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
-            StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
-        ):
-            return native(metadata_reason)
         if metadata_reason != StagedSFARouteReason.ELIGIBLE:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,

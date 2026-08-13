@@ -336,6 +336,120 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+_STAGED_SFA_FRONTIER_CONTRACT_VERSION = 2
+
+
+def _staged_sfa_metadata_frontiers(
+    metadata: Any,
+    request_ids: Any,
+) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
+    """Validate main request metadata and resolve ordered remap frontiers."""
+    if metadata is None or request_ids is None:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
+    if (
+        getattr(metadata, "staged_sfa_frontier_contract_version", None)
+        != _STAGED_SFA_FRONTIER_CONTRACT_VERSION
+    ):
+        return StagedSFARouteReason.FRONTIER_CONTRACT_MISMATCH, ()
+
+    active_request_ids = [str(req_id) for req_id in request_ids]
+    if not active_request_ids or len(set(active_request_ids)) != len(
+        active_request_ids
+    ):
+        return StagedSFARouteReason.INVALID_REQUEST_IDS, ()
+    active_request_id_set = set(active_request_ids)
+    main_by_req: dict[str, Any] = {}
+    try:
+        metadata_requests = tuple(getattr(metadata, "requests", ()))
+    except (TypeError, ValueError):
+        return StagedSFARouteReason.INVALID_FRONTIER, ()
+    for request in metadata_requests:
+        req_id = str(getattr(request, "req_id", ""))
+        if req_id not in active_request_id_set:
+            continue
+        if getattr(request, "is_decode_window_save", False):
+            continue
+        if req_id in main_by_req:
+            return StagedSFARouteReason.DUPLICATE_MAIN_METADATA, ()
+        main_by_req[req_id] = request
+
+    if set(main_by_req) != active_request_id_set:
+        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
+
+    dense_request_ids: set[str] = set()
+    sparse_request_ids: set[str] = set()
+    frontiers: list[int] = []
+    for req_id in active_request_ids:
+        request = main_by_req[req_id]
+        released_raw = getattr(request, "dsa_released_frontier", None)
+        if released_raw is None:
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        try:
+            released = int(released_raw)
+        except (TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        history_raw = getattr(
+            request,
+            "dsa_release_history_frontier",
+            None,
+        )
+        if history_raw is None:
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        try:
+            release_history = int(history_raw)
+        except (TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        if released < 0 or release_history < 0:
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+
+        if not getattr(request, "is_sparse_decode", False):
+            if released != 0 or release_history != 0:
+                return StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()
+            dense_request_ids.add(req_id)
+            frontiers.append(0)
+            continue
+
+        sparse_request_ids.add(req_id)
+        load_spec = getattr(request, "load_spec", None)
+        if load_spec is None:
+            return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
+        can_load = bool(getattr(load_spec, "can_load", False))
+        try:
+            cached = int(
+                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        committed_raw = getattr(load_spec, "dsa_committed_end", None)
+        try:
+            committed = int(
+                committed_raw
+                if committed_raw is not None
+                else (cached if can_load else 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        if (
+            committed < 0
+            or cached < 0
+            or committed > cached
+            or released > committed
+            or released > release_history
+        ):
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        if can_load and release_history > committed:
+            return StagedSFARouteReason.INVALID_FRONTIER, ()
+        if not can_load and (released > 0 or release_history > 0):
+            return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
+        frontiers.append(committed if can_load else 0)
+
+    if dense_request_ids and sparse_request_ids:
+        return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, tuple(frontiers)
+    if sparse_request_ids:
+        return StagedSFARouteReason.ELIGIBLE, tuple(frontiers)
+    return StagedSFARouteReason.DENSE_PREFIX_HIT, tuple(frontiers)
+
+
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     """Return a proven remap frontier for every active request.
 
@@ -344,9 +458,9 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     zero because it reads its full prefix from the block table, so compact-
     scratch remapping must remain disabled for it. A save-only meta (decode-
     window save sharing the main request's req_id) never overrides an existing
-    frontier, and an active request absent from the metadata is treated as
-    dense (zero frontier) — matching the route-level fallback to native
-    attention.
+    frontier. Save-only metadata is ignored explicitly. Every active request
+    must have one validated main metadata entry; absence never invents a zero
+    frontier.
     """
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
@@ -369,128 +483,28 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     except Exception as exc:
         raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
 
-    sparse_by_req: dict[str, int] = {}
-    for request in getattr(metadata, "requests", ()):
-        if not getattr(request, "is_sparse_decode", False):
-            continue
-        req_id = str(getattr(request, "req_id", ""))
-        if not req_id:
-            raise RuntimeError(
-                "[SFA sparse remap] connector remap metadata has an empty request ID."
-            )
-        if req_id in sparse_by_req:
-            raise RuntimeError(
-                "[SFA sparse remap] connector remap metadata contains a "
-                f"duplicate request ID: {req_id!r}."
-            )
-        load_spec = getattr(request, "load_spec", None)
-        if load_spec is None or not getattr(load_spec, "can_load", False):
-            sparse_by_req[req_id] = 0
-        else:
-            sparse_by_req[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None) is not None
-                else getattr(load_spec, "lmcache_cached_tokens", 0)
-            )
-    cached_by_req: dict[str, int] = dict(sparse_by_req)
-    for request in getattr(metadata, "requests", ()):
-        if getattr(request, "is_sparse_decode", False):
-            continue
-        req_id = str(getattr(request, "req_id", ""))
-        if not req_id:
-            raise RuntimeError(
-                "[SFA sparse remap] connector remap metadata has an empty request ID."
-            )
-        if req_id in cached_by_req:
-            # Save-only meta (decode-window save) sharing the main request's
-            # req_id: keep the recorded sparse frontier / dense zero entry.
-            continue
-        # Dense fast-path request or dense-prefix load: no compact-scratch
-        # remap, so the request is proven with a zero frontier.
-        cached_by_req[req_id] = 0
-
-    for req_id in normalized_request_ids:
-        # Fail open: an active request absent from the metadata (e.g. async
-        # lookup not yet complete, or a short request with neither load nor
-        # save) cannot be remapped; treat it as dense instead of killing the
-        # step. The route already fell back to native attention for it.
-        cached_by_req.setdefault(req_id, 0)
-    return [cached_by_req[req_id] for req_id in normalized_request_ids]
+    reason, frontiers = _staged_sfa_metadata_frontiers(
+        metadata,
+        normalized_request_ids,
+    )
+    if reason not in (
+        StagedSFARouteReason.ELIGIBLE,
+        StagedSFARouteReason.DENSE_PREFIX_HIT,
+        StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+    ):
+        raise RuntimeError(
+            "[SFA sparse remap] connector frontier validation failed: "
+            f"{reason.value}."
+        )
+    return list(frontiers)
 
 
 def staged_sfa_metadata_sparse_load(
     metadata: Any,
     request_ids: Any,
 ) -> tuple[StagedSFARouteReason, tuple[int, ...]]:
-    """Classify active connector metadata and return ordered frontiers."""
-    if metadata is None or request_ids is None:
-        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
-    active_request_ids = [str(req_id) for req_id in request_ids]
-    if not active_request_ids or len(set(active_request_ids)) != len(active_request_ids):
-        return StagedSFARouteReason.INVALID_REQUEST_IDS, ()
-    active_request_id_set = set(active_request_ids)
-    sparse_frontiers: dict[str, int] = {}
-    dense_request_ids: set[str] = set()
-    matched_request_ids: set[str] = set()
-    for request in getattr(metadata, "requests", ()):
-        req_id = str(getattr(request, "req_id", ""))
-        if req_id not in active_request_id_set:
-            continue
-        matched_request_ids.add(req_id)
-        if not getattr(request, "is_sparse_decode", False):
-            continue
-        if req_id in sparse_frontiers:
-            return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
-        load_spec = getattr(request, "load_spec", None)
-        sparse_frontiers[req_id] = int(
-            getattr(load_spec, "dsa_committed_end", None)
-            if getattr(load_spec, "dsa_committed_end", None)
-            is not None
-            else (
-                getattr(load_spec, "lmcache_cached_tokens", 0)
-                if getattr(load_spec, "can_load", False)
-                else 0
-            )
-            or 0
-        )
-    for request in getattr(metadata, "requests", ()):
-        req_id = str(getattr(request, "req_id", ""))
-        if req_id not in active_request_id_set:
-            continue
-        if getattr(request, "is_sparse_decode", False):
-            continue
-        if req_id in sparse_frontiers:
-            # Save-only meta (decode-window save) sharing the main request's
-            # req_id: never a dense load (would collide with the sparse
-            # frontier, DUPLICATE_SPARSE_LOAD).
-            continue
-        # Dense fast-path request (is_sparse_decode=False): the whole prefix
-        # is resident, so it is a dense-prefix hit whether or not a load spec
-        # is still carried. The steady state strips the spec after the first
-        # scheduled step (load_spec=None); classifying it dense keeps the
-        # staged-SFA route on the captured graph instead of the eager
-        # fallback. The transfer phase (load spec present) is distinguished
-        # by the route's load-transfer guard.
-        dense_request_ids.add(req_id)
-
-    if dense_request_ids.intersection(sparse_frontiers):
-        return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
-    loadable_request_ids = dense_request_ids.union(sparse_frontiers)
-    if loadable_request_ids == active_request_id_set:
-        if dense_request_ids and sparse_frontiers:
-            return (
-                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-                tuple(
-                    sparse_frontiers.get(req_id, 0)
-                    for req_id in active_request_ids
-                ),
-            )
-        if sparse_frontiers:
-            return StagedSFARouteReason.ELIGIBLE, tuple(sparse_frontiers[req_id] for req_id in active_request_ids)
-        return StagedSFARouteReason.DENSE_PREFIX_HIT, ()
-    if matched_request_ids != active_request_id_set:
-        return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
-    return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
+    """Classify validated main connector metadata and ordered frontiers."""
+    return _staged_sfa_metadata_frontiers(metadata, request_ids)
 
 
 def wait_for_kv_layer_from_connector(

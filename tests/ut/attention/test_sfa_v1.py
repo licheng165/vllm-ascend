@@ -38,6 +38,20 @@ from vllm_ascend.utils import (
 )
 
 
+def _frontier_metadata(requests):
+    for request in requests:
+        if not hasattr(request, "dsa_released_frontier"):
+            request.dsa_released_frontier = 0
+        if not hasattr(request, "dsa_release_history_frontier"):
+            request.dsa_release_history_frontier = 0
+        if not hasattr(request, "is_decode_window_save"):
+            request.is_decode_window_save = False
+    return SimpleNamespace(
+        requests=requests,
+        staged_sfa_frontier_contract_version=2,
+    )
+
+
 def test_sfa_metadata_declares_cached_decode_split_boundary() -> None:
     field = AscendSFAMetadata.__dataclass_fields__["decode_split_boundary"]
     assert field.default is None
@@ -212,8 +226,8 @@ def test_sparse_boundary_rejects_empty_frontiers_with_decode_rows():
 def test_sparse_boundary_prefers_explicit_committed_end():
     from vllm_ascend.attention import utils as attention_utils
 
-    metadata = SimpleNamespace(
-        requests=[
+    metadata = _frontier_metadata(
+        [
             SimpleNamespace(
                 req_id="resident",
                 is_sparse_decode=True,
@@ -253,7 +267,7 @@ def _remap_connector(requests):
         supports_staged_sfa_sparse_load=True,
         uses_layerwise_model_callbacks=True,
         wait_for_layer_load=lambda *_args, **_kwargs: None,
-        _get_connector_metadata=lambda: SimpleNamespace(requests=requests),
+        _get_connector_metadata=lambda: _frontier_metadata(requests),
     )
 
 
@@ -292,8 +306,6 @@ def test_dense_request_first_decode_step_is_proven_with_zero_frontier():
 def test_dense_request_without_load_spec_is_proven_with_zero_frontier():
     """Regression: 0804-3. A short request with neither load nor save spec
     (no connector metadata entry semantics) must resolve to zero, not raise."""
-    from vllm_ascend.attention import utils as attention_utils
-
     assert _run_remap_resolution(
         [
             SimpleNamespace(
@@ -310,8 +322,6 @@ def test_save_only_meta_never_overrides_sparse_frontier():
     """Regression: a decode-window save-only meta (load_spec=None) sharing the
     main request's req_id must not clobber the sparse frontier or raise a
     duplicate, regardless of metadata order."""
-    from vllm_ascend.attention import utils as attention_utils
-
     main = SimpleNamespace(
         req_id="long-req",
         is_sparse_decode=True,
@@ -330,16 +340,14 @@ def test_save_only_meta_never_overrides_sparse_frontier():
     assert _run_remap_resolution([save_only, main], ["long-req"]) == [8192]
 
 
-def test_active_request_absent_from_metadata_falls_back_to_dense():
-    """Regression: 0804-3. An active request absent from the connector metadata
-    (async lookup not yet complete) must fail open with a zero frontier."""
-    from vllm_ascend.attention import utils as attention_utils
-
-    assert _run_remap_resolution([], ["short-req"]) == [0]
+def test_active_request_absent_from_metadata_fails_closed():
+    """Missing main metadata must not invent a resident zero frontier."""
+    with pytest.raises(RuntimeError, match="missing_connector_metadata"):
+        _run_remap_resolution([], ["short-req"])
 
 
 def test_duplicate_sparse_metas_still_raise():
-    with pytest.raises(RuntimeError, match="duplicate request ID"):
+    with pytest.raises(RuntimeError, match="duplicate_main_metadata"):
         _run_remap_resolution(
             [
                 SimpleNamespace(
@@ -470,7 +478,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 lmcache_cached_tokens=128,
             ),
         )
-        metadata = SimpleNamespace(requests=[sparse])
+        metadata = _frontier_metadata([sparse])
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(
                 metadata,
@@ -485,12 +493,12 @@ class TestLMCacheSparseFrontier(TestBase):
                 metadata,
                 ["req-0"],
             ),
-            (StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()),
+            (StagedSFARouteReason.DUPLICATE_MAIN_METADATA, ()),
         )
 
     def test_missing_active_request_frontier_fails_closed(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="req-0",
                     is_sparse_decode=True,
@@ -509,9 +517,142 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()),
         )
 
+    def test_save_only_metadata_without_main_fails_closed(self):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="released",
+                    is_sparse_decode=False,
+                    is_decode_window_save=True,
+                    dsa_released_frontier=8192,
+                    load_spec=None,
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["released"],
+            ),
+            (StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()),
+        )
+
+    def test_released_request_cannot_claim_dense_residence(self):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="released",
+                    is_sparse_decode=False,
+                    dsa_released_frontier=8192,
+                    dsa_release_history_frontier=8192,
+                    load_spec=None,
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["released"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()),
+        )
+
+    def test_released_request_requires_loadable_covering_frontier(self):
+        request = SimpleNamespace(
+            req_id="released",
+            is_sparse_decode=True,
+            dsa_released_frontier=8192,
+            dsa_release_history_frontier=8192,
+            load_spec=SimpleNamespace(
+                can_load=False,
+                lmcache_cached_tokens=8192,
+                dsa_committed_end=8192,
+            ),
+        )
+        metadata = _frontier_metadata([request])
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["released"],
+            ),
+            (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
+        )
+        request.load_spec.can_load = True
+        request.load_spec.lmcache_cached_tokens = 4096
+        request.load_spec.dsa_committed_end = 4096
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["released"],
+            ),
+            (StagedSFARouteReason.INVALID_FRONTIER, ()),
+        )
+
+    def test_first_sparse_step_without_load_uses_never_released_proof(self):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="growing",
+                    is_sparse_decode=True,
+                    dsa_released_frontier=0,
+                    load_spec=SimpleNamespace(
+                        can_load=False,
+                        lmcache_cached_tokens=0,
+                        dsa_committed_end=0,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["growing"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (0,)),
+        )
+
+    def test_sparse_unavailable_after_historical_release_fails_closed(self):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="released",
+                    is_sparse_decode=True,
+                    dsa_released_frontier=0,
+                    dsa_release_history_frontier=8192,
+                    load_spec=SimpleNamespace(
+                        can_load=False,
+                        lmcache_cached_tokens=0,
+                        dsa_committed_end=0,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["released"],
+            ),
+            (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
+        )
+
+    def test_old_frontier_contract_fails_closed(self):
+        metadata = SimpleNamespace(requests=[])
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req"],
+            ),
+            (StagedSFARouteReason.FRONTIER_CONTRACT_MISMATCH, ()),
+        )
+
     def test_frontiers_preserve_native_request_order(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="req-1",
                     is_sparse_decode=True,
@@ -539,8 +680,8 @@ class TestLMCacheSparseFrontier(TestBase):
         )
 
     def test_dense_prefix_hit_is_not_a_sparse_graph_step(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="req-0",
                     is_sparse_decode=False,
@@ -554,7 +695,7 @@ class TestLMCacheSparseFrontier(TestBase):
 
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
         self.assertEqual(
             self._remap_frontiers(metadata, ["req-0"]),
@@ -572,8 +713,8 @@ class TestLMCacheSparseFrontier(TestBase):
         )
 
     def test_sparse_route_prefers_committed_boundary_over_load_length(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="resident",
                     is_sparse_decode=True,
@@ -603,8 +744,8 @@ class TestLMCacheSparseFrontier(TestBase):
         )
 
     def test_cold_compact_resume_excludes_recomputed_last_prompt_token(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="cold-compact",
                     is_sparse_decode=True,
@@ -631,8 +772,8 @@ class TestLMCacheSparseFrontier(TestBase):
         )
 
     def test_mixed_load_requires_every_row_to_be_loadable(self):
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="dense",
                     is_sparse_decode=False,
@@ -675,8 +816,8 @@ class TestLMCacheSparseFrontier(TestBase):
         can_load=False (prefix not yet resident) must classify as
         DENSE_PREFIX_HIT (SAFE_NATIVE), not SPARSE_LOAD_UNAVAILABLE (FATAL),
         so the staged-SFA local route does not become fatal across DP."""
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="dense",
                     is_sparse_decode=False,
@@ -689,7 +830,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 metadata,
                 ["dense"],
             ),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
 
     def test_dense_request_steady_state_without_load_spec_is_dense_prefix_hit(
@@ -700,8 +841,8 @@ class TestLMCacheSparseFrontier(TestBase):
         It must classify as DENSE_PREFIX_HIT (so the route can stage the step
         on the captured graph), not SPARSE_LOAD_UNAVAILABLE which kept every
         step on the slow eager path."""
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="dense",
                     is_sparse_decode=False,
@@ -714,7 +855,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 metadata,
                 ["dense"],
             ),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
         self.assertEqual(
             self._remap_frontiers(metadata, ["dense"]),
@@ -733,31 +874,32 @@ class TestLMCacheSparseFrontier(TestBase):
         save_only = SimpleNamespace(
             req_id="dense",
             is_sparse_decode=False,
+            is_decode_window_save=True,
             load_spec=None,
         )
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(
-                SimpleNamespace(requests=[main, save_only]),
+                _frontier_metadata([main, save_only]),
                 ["dense"],
             ),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(
-                SimpleNamespace(requests=[save_only, main]),
+                _frontier_metadata([save_only, main]),
                 ["dense"],
             ),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
 
     def test_sparse_request_with_save_only_meta_is_not_duplicate(self):
         """Regression: a long (sparse) request whose decode-window-save meta
         (load_spec=None, is_sparse_decode=False, same req_id) is emitted in the
-        same step must still classify as ELIGIBLE, not DUPLICATE_SPARSE_LOAD.
+        same step must still classify as ELIGIBLE, not duplicate main metadata.
         Save-only metas are not dense loads and must not collide with the main
         request's sparse frontier."""
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="long",
                     is_sparse_decode=True,
@@ -769,6 +911,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="long",
                     is_sparse_decode=False,
+                    is_decode_window_save=True,
                     load_spec=None,
                 ),
             ]
@@ -784,8 +927,8 @@ class TestLMCacheSparseFrontier(TestBase):
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
         self,
     ) -> None:
-        metadata = SimpleNamespace(
-            requests=[
+        metadata = _frontier_metadata(
+            [
                 SimpleNamespace(
                     req_id="sparse",
                     is_sparse_decode=True,

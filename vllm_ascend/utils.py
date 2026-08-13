@@ -112,9 +112,12 @@ class StagedSFARouteReason(str, Enum):
     MIXED_CONNECTOR_LOAD = "mixed_connector_load"
     MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
     SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
+    FRONTIER_CONTRACT_MISMATCH = "frontier_contract_mismatch"
+    INVALID_FRONTIER = "invalid_frontier"
+    DENSE_PREFIX_NOT_RESIDENT = "dense_prefix_not_resident"
     FRONTIER_TOO_SHORT = "frontier_too_short"
     FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
-    DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    DUPLICATE_MAIN_METADATA = "duplicate_main_metadata"
     RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
 
 

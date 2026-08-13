@@ -25,6 +25,20 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+def _frontier_metadata(requests):
+    for request in requests:
+        if not hasattr(request, "dsa_released_frontier"):
+            request.dsa_released_frontier = 0
+        if not hasattr(request, "dsa_release_history_frontier"):
+            request.dsa_release_history_frontier = 0
+        if not hasattr(request, "is_decode_window_save"):
+            request.is_decode_window_save = False
+    return SimpleNamespace(
+        requests=requests,
+        staged_sfa_frontier_contract_version=2,
+    )
+
+
 class TestFixedDecodeLayoutArrays(unittest.TestCase):
     def test_q1_layout_is_identity(self):
         req_indices, offsets, cumulative = (
@@ -629,8 +643,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "index_topk": 2048,
             "has_cascade_attention": False,
             "request_ids": request_ids,
-            "kv_connector_metadata": SimpleNamespace(
-                requests=[
+            "kv_connector_metadata": _frontier_metadata(
+                [
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=True,
@@ -680,7 +694,9 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 num_reqs=1,
                 num_scheduled_tokens=np.ones(1, dtype=np.int32),
                 request_ids=request_ids[:1],
-                kv_connector_metadata=SimpleNamespace(requests=local_kwargs["kv_connector_metadata"].requests[:1]),
+                kv_connector_metadata=_frontier_metadata(
+                    local_kwargs["kv_connector_metadata"].requests[:1]
+                ),
             )
             padded_route = runner._staged_sfa_live_route(
                 local_route=runner._staged_sfa_local_route(**one_request_kwargs),
@@ -704,8 +720,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 },
                 "cascade": {"has_cascade_attention": True},
                 "dense_prefix_hit": {
-                    "kv_connector_metadata": SimpleNamespace(
-                        requests=[
+                    "kv_connector_metadata": _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=False,
@@ -716,8 +732,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "dense_prefix_hit_loading": {
-                    "kv_connector_metadata": SimpleNamespace(
-                        requests=[
+                    "kv_connector_metadata": _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=False,
@@ -728,8 +744,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "mixed_connector_load": {
-                    "kv_connector_metadata": SimpleNamespace(
-                        requests=[
+                    "kv_connector_metadata": _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=index >= 2,
@@ -743,8 +759,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "mixed_connector_load_steady": {
-                    "kv_connector_metadata": SimpleNamespace(
-                        requests=[
+                    "kv_connector_metadata": _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=index >= 2,
@@ -763,8 +779,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     ),
                 },
                 "short_frontier": {
-                    "kv_connector_metadata": SimpleNamespace(
-                        requests=[
+                    "kv_connector_metadata": _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=True,
@@ -891,8 +907,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             "index_topk": 2048,
             "has_cascade_attention": False,
             "request_ids": request_ids,
-            "kv_connector_metadata": SimpleNamespace(
-                requests=[
+            "kv_connector_metadata": _frontier_metadata(
+                [
                     # Steady state: the prefix is resident and the load spec
                     # has been stripped (load_spec=None).
                     SimpleNamespace(
@@ -946,8 +962,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             # was set up, not that the KV is resident yet).
             for can_load in (False, True):
                 loading_kwargs = dict(local_kwargs)
-                loading_kwargs["kv_connector_metadata"] = SimpleNamespace(
-                    requests=[
+                loading_kwargs["kv_connector_metadata"] = _frontier_metadata(
+                    [
                         SimpleNamespace(
                             req_id=req_id,
                             is_sparse_decode=False,
@@ -969,15 +985,10 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         StagedSFARouteReason.DENSE_PREFIX_HIT,
                     )
 
-    def test_missing_or_unavailable_connector_metadata_falls_back_native(
+    def test_missing_or_unavailable_connector_metadata_fails_closed(
         self,
     ):
-        """Regression: with the dense fast-path (方案 A), a short request may
-        have no connector metadata entry (e.g. no load spec). The staged-SFA
-        local route must fall back to SAFE_NATIVE for
-        MISSING_CONNECTOR_METADATA and SPARSE_LOAD_UNAVAILABLE instead of
-        FATAL, otherwise the DP route becomes fatal (runtime_parallelism on the
-        peer) and real inference crashes."""
+        """Missing or unloadable main metadata must never read native KV."""
         runner = self._build_runner()
         request_ids = [f"req-{index}" for index in range(4)]
         base = {
@@ -998,16 +1009,22 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             for metadata, expected_reason in (
                 (None, StagedSFARouteReason.MISSING_CONNECTOR_METADATA),
                 (
-                    SimpleNamespace(requests=[]),
+                    _frontier_metadata([]),
                     StagedSFARouteReason.MISSING_CONNECTOR_METADATA,
                 ),
                 (
-                    SimpleNamespace(
-                        requests=[
+                    _frontier_metadata(
+                        [
                             SimpleNamespace(
                                 req_id=req_id,
-                                is_sparse_decode=False,
-                                load_spec=None,
+                                is_sparse_decode=True,
+                                dsa_released_frontier=4096,
+                                dsa_release_history_frontier=4096,
+                                load_spec=SimpleNamespace(
+                                    can_load=False,
+                                    lmcache_cached_tokens=4096,
+                                    dsa_committed_end=4096,
+                                ),
                             )
                             for req_id in request_ids
                         ]
@@ -1022,7 +1039,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     )
                     self.assertEqual(
                         route.action,
-                        StagedSFARouteAction.SAFE_NATIVE,
+                        StagedSFARouteAction.FATAL,
                     )
                     self.assertEqual(route.reason, expected_reason)
 
@@ -1137,8 +1154,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
-            kv_connector_metadata=SimpleNamespace(
-                requests=[
+            kv_connector_metadata=_frontier_metadata(
+                [
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=True,
@@ -1174,8 +1191,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
-            kv_connector_metadata=SimpleNamespace(
-                requests=[
+            kv_connector_metadata=_frontier_metadata(
+                [
                     SimpleNamespace(
                         req_id="req-0",
                         is_sparse_decode=True,
