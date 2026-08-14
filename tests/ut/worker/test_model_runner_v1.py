@@ -797,12 +797,13 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 rejected.update(overrides)
                 with self.subTest(name=name):
                     route = runner._staged_sfa_local_route(**rejected)
-                    if name == "dense_prefix_hit":
-                        # 方案 A dense fast-path steady state: the whole prefix
-                        # is resident (no load spec), so the step is staged
-                        # with zero frontiers (no compact-scratch remap)
-                        # instead of the eager native fallback, keeping both
-                        # DPs on the captured graph.
+                    if name in (
+                        "dense_prefix_hit",
+                        "dense_prefix_hit_loading",
+                    ):
+                        # A zero frontier disables compact-scratch remapping;
+                        # the eager retrieve split still advances any pending
+                        # dense transfer between captured graph islands.
                         self.assertEqual(
                             route.action,
                             StagedSFARouteAction.STAGED,
@@ -812,26 +813,26 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             StagedSFARouteReason.DENSE_PREFIX_HIT,
                         )
                         self.assertEqual(route.frontiers, (0,) * 4)
-                        continue
-                    if name == "dense_prefix_hit_loading":
-                        # Transfer phase: a load spec is still carried, so the
-                        # step stays eager (the per-layer connector waits
-                        # perform the KV transfer).
-                        self.assertEqual(
-                            route.action,
-                            StagedSFARouteAction.SAFE_NATIVE,
+                        live_route = runner._staged_sfa_live_route(
+                            local_route=route,
+                            **final_kwargs,
                         )
                         self.assertEqual(
-                            route.reason,
-                            StagedSFARouteReason.DENSE_PREFIX_HIT,
+                            live_route.action,
+                            StagedSFARouteAction.STAGED,
+                        )
+                        self.assertEqual(
+                            live_route.graph_key,
+                            StagedSFAGraphKey.exact_q1(4),
                         )
                         continue
-                    if name == "mixed_connector_load_steady":
+                    if name in (
+                        "mixed_connector_load",
+                        "mixed_connector_load_steady",
+                    ):
                         # Regression: 0806-2. Mixed long-sparse + short-dense
-                        # step whose dense member is resident (no load spec)
-                        # must run the captured graph with the per-row
-                        # frontiers (0 for dense, committed end for sparse)
-                        # instead of the eager fallback.
+                        # steps use per-row frontiers while the eager split
+                        # advances a pending dense transfer, if present.
                         self.assertEqual(
                             route.action,
                             StagedSFARouteAction.STAGED,
@@ -842,7 +843,23 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         )
                         self.assertEqual(
                             route.frontiers,
-                            (0, 0, 8192, 8192),
+                            (
+                                (0, 0, 4096, 4096)
+                                if name == "mixed_connector_load"
+                                else (0, 0, 8192, 8192)
+                            ),
+                        )
+                        live_route = runner._staged_sfa_live_route(
+                            local_route=route,
+                            **final_kwargs,
+                        )
+                        self.assertEqual(
+                            live_route.action,
+                            StagedSFARouteAction.STAGED,
+                        )
+                        self.assertEqual(
+                            live_route.frontiers,
+                            route.frontiers,
                         )
                         continue
                     self.assertEqual(
@@ -853,12 +870,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             else StagedSFARouteAction.SAFE_NATIVE
                         ),
                     )
-                    if name == "mixed_connector_load":
-                        self.assertEqual(
-                            route.reason,
-                            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-                        )
-                    elif name == "short_frontier":
+                    if name == "short_frontier":
                         self.assertEqual(
                             route.reason,
                             StagedSFARouteReason.FRONTIER_TOO_SHORT,
@@ -954,11 +966,9 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             self.assertEqual(live_route.graph_key, StagedSFAGraphKey.exact_q1(4))
             self.assertEqual(live_route.frontiers, (0,) * 4)
 
-            # First decode step: the prefix transfer is still in flight (a
-            # load spec is carried), so the step must stay on the eager native
-            # path where the per-layer connector waits perform the transfer —
-            # regardless of can_load (can_load=True only means the retrieval
-            # was set up, not that the KV is resident yet).
+            # A pending load spec does not force eager model execution. The
+            # retrieve splitting op remains eager between captured islands and
+            # performs any layerwise transfer required by can_load=True.
             for can_load in (False, True):
                 loading_kwargs = dict(local_kwargs)
                 loading_kwargs["kv_connector_metadata"] = _frontier_metadata(
@@ -977,11 +987,30 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     )
                     self.assertEqual(
                         loading_route.action,
-                        StagedSFARouteAction.SAFE_NATIVE,
+                        StagedSFARouteAction.STAGED,
                     )
                     self.assertEqual(
                         loading_route.reason,
                         StagedSFARouteReason.DENSE_PREFIX_HIT,
+                    )
+                    self.assertEqual(loading_route.frontiers, (0,) * 4)
+                    loading_live_route = runner._staged_sfa_live_route(
+                        local_route=loading_route,
+                        dp_route_action=StagedSFARouteAction.STAGED,
+                        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                        batch_descriptor=BatchDescriptor(num_tokens=4),
+                        num_tokens_unpadded=4,
+                        num_tokens_padded=4,
+                        num_reqs=4,
+                        should_ubatch=False,
+                    )
+                    self.assertEqual(
+                        loading_live_route.action,
+                        StagedSFARouteAction.STAGED,
+                    )
+                    self.assertEqual(
+                        loading_live_route.graph_key,
+                        StagedSFAGraphKey.exact_q1(4),
                     )
 
     def test_missing_or_unavailable_connector_metadata_fails_closed(

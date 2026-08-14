@@ -1692,6 +1692,10 @@ class TestStagedSFAGraphPoc(TestBase):
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
         )
+        self.assertIs(
+            wait_for_layer.call_args_list[0].kwargs["request_ids"],
+            metadata.decode_request_ids_compact,
+        )
         prepare_boundary.assert_called_once_with(
             next_metadata,
             next_metadata.req_ids,
