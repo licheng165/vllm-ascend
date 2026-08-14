@@ -27,15 +27,14 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 def _frontier_metadata(requests):
     for request in requests:
-        if not hasattr(request, "dsa_released_frontier"):
-            request.dsa_released_frontier = 0
-        if not hasattr(request, "dsa_release_history_frontier"):
-            request.dsa_release_history_frontier = 0
+        if not hasattr(request, "dsa_current_released_frontier"):
+            request.dsa_current_released_frontier = 0
+        if not hasattr(request, "dsa_nonresident_frontier"):
+            request.dsa_nonresident_frontier = 0
         if not hasattr(request, "is_decode_window_save"):
             request.is_decode_window_save = False
     return SimpleNamespace(
         requests=requests,
-        staged_sfa_frontier_contract_version=2,
     )
 
 
@@ -1018,8 +1017,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=True,
-                                dsa_released_frontier=4096,
-                                dsa_release_history_frontier=4096,
+                                dsa_current_released_frontier=4096,
+                                dsa_nonresident_frontier=4096,
                                 load_spec=SimpleNamespace(
                                     can_load=False,
                                     lmcache_cached_tokens=4096,

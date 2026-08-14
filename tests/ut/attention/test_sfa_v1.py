@@ -40,15 +40,14 @@ from vllm_ascend.utils import (
 
 def _frontier_metadata(requests):
     for request in requests:
-        if not hasattr(request, "dsa_released_frontier"):
-            request.dsa_released_frontier = 0
-        if not hasattr(request, "dsa_release_history_frontier"):
-            request.dsa_release_history_frontier = 0
+        if not hasattr(request, "dsa_current_released_frontier"):
+            request.dsa_current_released_frontier = 0
+        if not hasattr(request, "dsa_nonresident_frontier"):
+            request.dsa_nonresident_frontier = 0
         if not hasattr(request, "is_decode_window_save"):
             request.is_decode_window_save = False
     return SimpleNamespace(
         requests=requests,
-        staged_sfa_frontier_contract_version=2,
     )
 
 
@@ -524,7 +523,7 @@ class TestLMCacheSparseFrontier(TestBase):
                     req_id="released",
                     is_sparse_decode=False,
                     is_decode_window_save=True,
-                    dsa_released_frontier=8192,
+                    dsa_current_released_frontier=8192,
                     load_spec=None,
                 )
             ]
@@ -544,8 +543,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="released",
                     is_sparse_decode=False,
-                    dsa_released_frontier=8192,
-                    dsa_release_history_frontier=8192,
+                    dsa_current_released_frontier=8192,
+                    dsa_nonresident_frontier=8192,
                     load_spec=None,
                 )
             ]
@@ -559,12 +558,87 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()),
         )
 
+    def test_cold_compact_nonresident_request_cannot_claim_dense_residence(
+        self,
+    ):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="cold-compact",
+                    is_sparse_decode=False,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=10_000,
+                    load_spec=None,
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["cold-compact"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()),
+        )
+
+    def test_cold_compact_nonresident_frontier_accepts_covering_sparse_load(
+        self,
+    ):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="cold-compact",
+                    is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=10_000,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=10_001,
+                        dsa_committed_end=10_000,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["cold-compact"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (10_000,)),
+        )
+
+    def test_current_release_cannot_exceed_nonresident_frontier(self):
+        metadata = _frontier_metadata(
+            [
+                SimpleNamespace(
+                    req_id="invalid-release",
+                    is_sparse_decode=True,
+                    dsa_current_released_frontier=8_192,
+                    dsa_nonresident_frontier=4_096,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8_192,
+                        dsa_committed_end=8_192,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["invalid-release"],
+            ),
+            (StagedSFARouteReason.INVALID_FRONTIER, ()),
+        )
+
     def test_released_request_requires_loadable_covering_frontier(self):
         request = SimpleNamespace(
             req_id="released",
             is_sparse_decode=True,
-            dsa_released_frontier=8192,
-            dsa_release_history_frontier=8192,
+            dsa_current_released_frontier=8192,
+            dsa_nonresident_frontier=8192,
             load_spec=SimpleNamespace(
                 can_load=False,
                 lmcache_cached_tokens=8192,
@@ -597,7 +671,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="growing",
                     is_sparse_decode=True,
-                    dsa_released_frontier=0,
+                    dsa_current_released_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=False,
                         lmcache_cached_tokens=0,
@@ -621,8 +695,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="released",
                     is_sparse_decode=True,
-                    dsa_released_frontier=0,
-                    dsa_release_history_frontier=8192,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
                         can_load=False,
                         lmcache_cached_tokens=0,
@@ -640,14 +714,24 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
         )
 
-    def test_old_frontier_contract_fails_closed(self):
-        metadata = SimpleNamespace(requests=[])
+    def test_legacy_metadata_shape_fails_closed(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="v2-shape",
+                    is_sparse_decode=False,
+                    dsa_released_frontier=0,
+                    dsa_release_history_frontier=0,
+                )
+            ],
+        )
+
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(
                 metadata,
-                ["req"],
+                ["v2-shape"],
             ),
-            (StagedSFARouteReason.FRONTIER_CONTRACT_MISMATCH, ()),
+            (StagedSFARouteReason.INVALID_FRONTIER, ()),
         )
 
     def test_frontiers_preserve_native_request_order(self):

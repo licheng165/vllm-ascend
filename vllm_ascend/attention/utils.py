@@ -336,9 +336,6 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
-_STAGED_SFA_FRONTIER_CONTRACT_VERSION = 2
-
-
 def _staged_sfa_metadata_frontiers(
     metadata: Any,
     request_ids: Any,
@@ -346,11 +343,6 @@ def _staged_sfa_metadata_frontiers(
     """Validate main request metadata and resolve ordered remap frontiers."""
     if metadata is None or request_ids is None:
         return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()
-    if (
-        getattr(metadata, "staged_sfa_frontier_contract_version", None)
-        != _STAGED_SFA_FRONTIER_CONTRACT_VERSION
-    ):
-        return StagedSFARouteReason.FRONTIER_CONTRACT_MISMATCH, ()
 
     active_request_ids = [str(req_id) for req_id in request_ids]
     if not active_request_ids or len(set(active_request_ids)) != len(
@@ -381,29 +373,29 @@ def _staged_sfa_metadata_frontiers(
     frontiers: list[int] = []
     for req_id in active_request_ids:
         request = main_by_req[req_id]
-        released_raw = getattr(request, "dsa_released_frontier", None)
-        if released_raw is None:
+        current_released_raw = getattr(request, "dsa_current_released_frontier", None)
+        if current_released_raw is None:
             return StagedSFARouteReason.INVALID_FRONTIER, ()
         try:
-            released = int(released_raw)
+            current_released = int(current_released_raw)
         except (TypeError, ValueError, OverflowError):
             return StagedSFARouteReason.INVALID_FRONTIER, ()
-        history_raw = getattr(
+        nonresident_raw = getattr(
             request,
-            "dsa_release_history_frontier",
+            "dsa_nonresident_frontier",
             None,
         )
-        if history_raw is None:
+        if nonresident_raw is None:
             return StagedSFARouteReason.INVALID_FRONTIER, ()
         try:
-            release_history = int(history_raw)
+            nonresident = int(nonresident_raw)
         except (TypeError, ValueError, OverflowError):
             return StagedSFARouteReason.INVALID_FRONTIER, ()
-        if released < 0 or release_history < 0:
+        if current_released < 0 or nonresident < 0:
             return StagedSFARouteReason.INVALID_FRONTIER, ()
 
         if not getattr(request, "is_sparse_decode", False):
-            if released != 0 or release_history != 0:
+            if current_released != 0 or nonresident != 0:
                 return StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()
             dense_request_ids.add(req_id)
             frontiers.append(0)
@@ -433,13 +425,12 @@ def _staged_sfa_metadata_frontiers(
             committed < 0
             or cached < 0
             or committed > cached
-            or released > committed
-            or released > release_history
+            or current_released > nonresident
         ):
             return StagedSFARouteReason.INVALID_FRONTIER, ()
-        if can_load and release_history > committed:
+        if can_load and nonresident > committed:
             return StagedSFARouteReason.INVALID_FRONTIER, ()
-        if not can_load and (released > 0 or release_history > 0):
+        if not can_load and (current_released > 0 or nonresident > 0):
             return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()
         frontiers.append(committed if can_load else 0)
 
