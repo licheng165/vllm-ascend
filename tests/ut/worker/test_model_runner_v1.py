@@ -449,6 +449,102 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 runner._staged_sfa_dummy_batch_size(**kwargs)
             )
 
+    def test_native_execution_waits_for_capture_unsafe_connector_loads(self):
+        runner = self._build_runner()
+        barrier = MagicMock()
+        connector = SimpleNamespace(
+            synchronize_staged_sfa_capture_unsafe_loads=barrier,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+        barrier.assert_called_once_with()
+
+    def test_native_execution_fails_closed_without_load_barrier(self):
+        runner = self._build_runner()
+        connector = SimpleNamespace(
+            supports_dsa_compact_external_load=True,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "capture-unsafe load barrier failed",
+            ),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+    def test_native_execution_propagates_peer_load_barrier_failure(self):
+        runner = self._build_runner()
+        barrier = MagicMock()
+        cpu_group = object()
+
+        def report_peer_failure(failure, **_kwargs):
+            failure.fill_(1)
+
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=SimpleNamespace(
+                    synchronize_staged_sfa_capture_unsafe_loads=barrier,
+                ),
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    world_size=2,
+                    cpu_group=cpu_group,
+                ),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=report_peer_failure,
+            ) as all_reduce,
+            self.assertRaisesRegex(RuntimeError, "peer worker"),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+        barrier.assert_called_once_with()
+        self.assertIs(all_reduce.call_args.kwargs["group"], cpu_group)
+
     def test_dp_sync_agrees_route_in_existing_collective(self):
         runner = self._build_runner()
         runner.dp_size = 2

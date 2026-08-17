@@ -1789,6 +1789,11 @@ class NPUModelRunner(GPUModelRunner):
             # __enter__. Sample committed frontiers only after that point so the
             # first forward that can retrieve a new window also forces a remap
             # diagnostic for the same window.
+            if (
+                self._staged_sfa_graph_capture_sizes
+                and staged_sfa_graph_key is None
+            ):
+                self._synchronize_staged_sfa_capture_unsafe_loads()
             if diag_enabled and dsa_req_ids is not None:
                 decode_requests = scheduled_decode_requests(
                     dsa_req_ids,
@@ -3095,6 +3100,66 @@ class NPUModelRunner(GPUModelRunner):
             StagedSFARouteReason.ELIGIBLE,
             frontiers=frontiers,
         )
+
+    def _synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
+        """Keep background cold loads out of serving-time graph capture."""
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        synchronize = getattr(
+            connector,
+            "synchronize_staged_sfa_capture_unsafe_loads",
+            None,
+        )
+        local_error: BaseException | None = None
+        try:
+            if callable(synchronize):
+                synchronize()
+            elif bool(
+                getattr(
+                    connector,
+                    "supports_dsa_compact_external_load",
+                    False,
+                )
+            ):
+                local_error = RuntimeError(
+                    "The staged SFA native fallback requires an LMCache "
+                    "connector with a capture-unsafe load barrier. Update "
+                    "LMCache before enabling asynchronous DSA cold compact "
+                    "loads."
+                )
+        except BaseException as exc:
+            local_error = exc
+
+        cpu_groups = []
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            cpu_groups.append(tp_group.cpu_group)
+        if self.parallel_config.data_parallel_size > 1:
+            cpu_groups.append(get_dp_group().cpu_group)
+        if not cpu_groups:
+            if local_error is not None:
+                raise RuntimeError(
+                    "The staged SFA capture-unsafe load barrier failed"
+                ) from local_error
+            return
+
+        failure = torch.tensor(
+            [int(local_error is not None)],
+            dtype=torch.int32,
+        )
+        for cpu_group in cpu_groups:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=cpu_group)
+        if int(failure.item()) != 0:
+            if local_error is not None:
+                raise RuntimeError(
+                    "The staged SFA capture-unsafe load barrier failed "
+                    "on this worker"
+                ) from local_error
+            raise RuntimeError(
+                "The staged SFA capture-unsafe load barrier failed on a peer "
+                "worker"
+            )
 
     def _staged_sfa_live_route(
         self,
