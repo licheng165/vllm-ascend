@@ -176,6 +176,44 @@ def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
     return False
 
 
+def _log_shared_indexer_reuse_map(
+    configs: tuple[Any, ...],
+    layer_name: str,
+) -> None:
+    """Log the frozen consumer->producer top-k reuse map once per process.
+
+    The mapping is derived from indexer_types: every consumer reads the
+    nearest PRECEDING full producer. This is the reuse contract the staged
+    graphs rely on (producer graph A publishes the shared buffer before any
+    consumer graph A in the same batch reads it).
+    """
+    indexer_types = _get_indexer_types(configs)
+    if indexer_types is None:
+        return
+    producer_layers = [
+        index for index, kind in enumerate(indexer_types) if str(kind).lower() == "full"
+    ]
+    if not producer_layers:
+        return
+    consumers: list[tuple[int, int]] = []
+    last_producer = producer_layers[0]
+    for index, kind in enumerate(indexer_types):
+        if str(kind).lower() == "full":
+            last_producer = index
+        else:
+            consumers.append((index, last_producer))
+    logger.info_once(
+        "DSA shared-indexer reuse map (derived from indexer_types): "
+        "producers=%s consumers=%s source_producer_per_consumer=%s "
+        "(logged from %s)",
+        producer_layers,
+        [consumer for consumer, _ in consumers],
+        {consumer: producer for consumer, producer in consumers},
+        layer_name,
+        scope="local",
+    )
+
+
 def _configured_resident_shards(mtp: int) -> tuple[int, int]:
     """Resolve the startup-static row and request shard counts."""
     shards_per_row = int(
@@ -213,6 +251,10 @@ class _StagedSFALayerBinding:
     kv_cache: tuple[_TensorBinding, ...]
     remap_boundary: _TensorBinding
     producer_event_id: int
+    # Shared-indexer (GLM-5.2): consumer graphs read the producer-written
+    # top-k buffer inside the capture; producer graphs write it. Its address
+    # and layout are part of the immutable capture contract.
+    topk_buffer: _TensorBinding | None = None
 
 
 @dataclass(slots=True)
@@ -232,6 +274,7 @@ class _StagedSFACaptureState:
         key: StagedSFAGraphKey,
         bridge: tuple[torch.Tensor, ...],
         kv_cache: tuple[torch.Tensor, ...],
+        topk_buffer: torch.Tensor | None = None,
     ) -> None:
         if key in self.bindings:
             raise RuntimeError(f"staged SFA graph key was captured twice: {key}")
@@ -243,6 +286,11 @@ class _StagedSFACaptureState:
             tuple(_TensorBinding.from_tensor(tensor) for tensor in kv_cache),
             _TensorBinding.from_tensor(self.remap_boundary),
             id(self.producer_event),
+            (
+                _TensorBinding.from_tensor(topk_buffer)
+                if topk_buffer is not None
+                else None
+            ),
         )
         if self.bindings:
             existing = next(iter(self.bindings.values()))
@@ -254,6 +302,7 @@ class _StagedSFACaptureState:
                 or binding.remap_boundary.layout[1:]
                 != existing.remap_boundary.layout[1:]
                 or binding.bridge != existing.bridge
+                or binding.topk_buffer != existing.topk_buffer
             ):
                 raise RuntimeError(
                     "staged SFA capture bindings changed between graph keys"
@@ -1818,6 +1867,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             "use_index_cache",
         ) or _has_shared_indexer_layers(config_candidates)
         self.use_index_cache = self.skip_topk or self.index_cache_enabled
+        if self.index_cache_enabled and self.layer_name is not None:
+            _log_shared_indexer_reuse_map(config_candidates, self.layer_name)
 
         # indexer param
         if self.has_indexer:
@@ -2781,17 +2832,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the DSA offload manager is active"
         if getattr(forward_context, "dsa_adapter_cache", None) is not None:
             return "the DSA adapter cache is active"
-        if len(kv_cache) != 3:
-            return "the POC requires exactly three KV tensors"
+        if len(kv_cache) not in ((3,) if self.has_indexer else (2, 3)):
+            return (
+                "the POC requires the indexer plane plus two latent tensors"
+                if self.has_indexer
+                else "the shared-consumer POC requires the two latent tensors"
+            )
         if any(cache.ndim != 4 for cache in kv_cache):
             return "the POC requires rank-4 PA_BSND KV tensors"
         if self.num_kv_heads != 1 or any(int(cache.shape[-2]) != 1 for cache in kv_cache):
             return "the POC requires one KV head in every cache tensor"
+        # Producers own the indexer key plane (kv_cache[2]); shared consumers
+        # only carry the latent planes and read the top-k from the shared
+        # buffer written by the nearest preceding producer graph.
         expected_hidden_dims = (
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             self.head_dim,
         )
+        if not self.has_indexer:
+            if self.topk_indices_buffer is None:
+                return "the shared-consumer staged graph requires the shared top-k buffer"
+            expected_hidden_dims = expected_hidden_dims[:2]
         if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(int(dim) for dim in expected_hidden_dims):
             return "the staged KV cache hidden dimensions do not match SFA"
         cache_block_sizes = {int(cache.shape[1]) for cache in kv_cache}
@@ -3089,7 +3151,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         hidden_states: torch.Tensor,
         kv_cache_nope: torch.Tensor,
         kv_cache_pe: torch.Tensor,
-        indexer_cache: torch.Tensor,
+        indexer_cache: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         slot_mapping: torch.Tensor,
@@ -3110,7 +3172,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         request_state_indices: torch.Tensor | None,
         request_state_generations: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
-        """Pre-retrieval compute captured by the outer PIECEWISE graph."""
+        """Pre-retrieval compute captured by the outer PIECEWISE graph.
+
+        Producer graph A: compute/scatter the indexer key, run top-k selection,
+        publish the raw top-k into the shared buffer (GLM-5.2), then prepare
+        the sparse indices for the LMCache selective retrieve.
+        Consumer graph A: no indexer compute/scatter; read the current batch's
+        top-k from the shared buffer written by the preceding producer graph,
+        then run the same sparse-index preparation.
+        """
         assert self.fused_qkv_a_proj is not None
         assert self.q_lora_rank is not None
         assert self.q_a_layernorm is not None
@@ -3126,13 +3196,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             dim=-1,
         )
         q_c = self.q_a_layernorm(q_c)
-        k_li, k_li_scale = self.indexer_select_pre_process(
-            x=hidden_states,
-            cos=cos,
-            sin=sin,
-        )
-        assert k_li_scale is None
-        kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+        if self.has_indexer:
+            k_li, k_li_scale = self.indexer_select_pre_process(
+                x=hidden_states,
+                cos=cos,
+                sin=sin,
+            )
+            assert k_li_scale is None
+            assert indexer_cache is not None
+            kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+        else:
+            k_li = None
+            assert indexer_cache is None
+            kv_cache = (kv_cache_nope, kv_cache_pe)
         self.exec_kv(
             kv_no_split,
             cos,
@@ -3144,24 +3220,41 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
-        k_li = self._get_full_kv(k_li, None)
 
-        torch_npu.npu_scatter_nd_update_(
-            indexer_cache.view(-1, k_li.shape[-1]),
-            indexer_slot_mapping.view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
-        )
-        topk_indices = self.indexer_select_post_process(
-            x=hidden_states,
-            q_c=q_c,
-            kv_cache=kv_cache,
-            attn_metadata=None,
-            cos=cos,
-            sin=sin,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            indexer_block_table_override=indexer_block_table,
-        )
+        if self.has_indexer:
+            k_li = self._get_full_kv(k_li, None)
+            assert indexer_cache is not None
+            torch_npu.npu_scatter_nd_update_(
+                indexer_cache.view(-1, k_li.shape[-1]),
+                indexer_slot_mapping.view(-1, 1),
+                k_li.view(-1, k_li.shape[-1]),
+            )
+        if self.skip_topk:
+            # Reuse the current batch's top-k from the shared buffer
+            # (GLM-5.2 shared consumers and runtime IndexCache skip layers).
+            topk_indices = self._get_indexcache_topk_indices(hidden_states.shape[0])
+        else:
+            if not self.has_indexer:
+                raise RuntimeError(
+                    "skip_topk is False but indexer is None. "
+                    f"layer_name={self.layer_name}."
+                )
+            topk_indices = self.indexer_select_post_process(
+                x=hidden_states,
+                q_c=q_c,
+                kv_cache=kv_cache,
+                attn_metadata=None,
+                cos=cos,
+                sin=sin,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                indexer_block_table_override=indexer_block_table,
+            )
+            if self.index_cache_enabled:
+                # Publish this batch's raw top-k BEFORE the remap so downstream
+                # skip-layer graph As in the same step read fresh indices from
+                # the stable shared buffer.
+                self._update_indexcache_topk_indices(topk_indices)
         staged_mtp = (
             int(topk_indices.shape[0])
             // int(request_block_table.shape[0])
@@ -3243,9 +3336,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         layer_name: str,
         kv_cache: tuple[torch.Tensor, ...],
     ) -> tuple[tuple[torch.Tensor, ...], str | None, bool]:
-        index_layer_name = _dsa_indexer_layer_name(layer_name) if self.dsa_offload_unbundle else None
+        # Shared-indexer consumers have no sibling indexer cache registered,
+        # so they keep their latent-only tuple and never resolve (or later
+        # wait on / save) a sibling name.
+        index_layer_name = (
+            _dsa_indexer_layer_name(layer_name)
+            if self.dsa_offload_unbundle and self.has_indexer
+            else None
+        )
         index_enabled = bool(index_layer_name is not None and _dsa_index_lmcache_enabled())
-        if self.dsa_offload_unbundle and len(kv_cache) < 3:
+        if index_layer_name is not None and self.dsa_offload_unbundle and len(kv_cache) < 3:
             index_cache = getattr(self, "_dsa_idx_cache_t", None)
             if index_cache is None:
                 context = get_forward_context()
@@ -3476,7 +3576,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states,
             kv_cache[0],
             kv_cache[1],
-            kv_cache[2],
+            kv_cache[2] if self.has_indexer else None,
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
@@ -3516,7 +3616,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             index_enabled,
         )
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
-            state.register(graph_key, outputs, kv_cache)
+            state.register(
+                graph_key,
+                outputs,
+                kv_cache,
+                # Seal the shared top-k buffer address/layout whenever a graph
+                # reads or writes it, so rebinding after capture fails closed.
+                topk_buffer=(
+                    self.topk_indices_buffer
+                    if (not self.has_indexer or self.index_cache_enabled)
+                    and self.topk_indices_buffer is not None
+                    else None
+                ),
+            )
         return outputs
 
     def _record_lmcache_load_stat(
@@ -3867,6 +3979,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             path,
         )
 
+    @staticmethod
+    def _layer_has_indexer_by_name(
+        context: Any,
+        attn_layer_name: str,
+    ) -> bool:
+        """Whether the layer owning ``attn_layer_name`` has a local indexer."""
+        wrapper = context.no_compile_layers.get(
+            attn_layer_name.rsplit(".attn", 1)[0]
+        )
+        if wrapper is None:
+            return True
+        return bool(getattr(wrapper, "mla_attn", None).impl.has_indexer)
+
     def cross_layer_lmcache_retrieve(
         self,
         layer_name: str,
@@ -3938,7 +4063,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     index_topk=self.index_topk,
                     cached_tokens=route.frontiers,
                 )
-                if index_enabled:
+                if index_enabled and self._layer_has_indexer_by_name(
+                    context, next_layer_name
+                ):
+                    # Only producer layers own an indexer cache to wait for;
+                    # shared consumers load no group-1 rows.
                     wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(next_layer_name))
 
     def bootstrap_cross_layer(self, layer_name: str) -> None:
@@ -4286,7 +4415,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         with _dsa_prof.section("indexer"):
-            if self.has_indexer:
+            if self.skip_topk:
+                # Reuse the current batch's top-k from the shared buffer:
+                # GLM-5.2 shared consumers (no local Indexer) and runtime
+                # IndexCache skip layers (GLM-5.1, indexer still present).
+                topk_indices = self._get_indexcache_topk_indices(
+                    num_input_tokens or hidden_states.shape[0]
+                )
+            else:
+                if not self.has_indexer:
+                    raise RuntimeError(
+                        "skip_topk is False but indexer is None. "
+                        f"layer_name={self.layer_name}."
+                    )
                 topk_indices = self.indexer_select_post_process(
                     x=hidden_states,
                     q_c=q_c,
@@ -4298,13 +4439,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
                 if self.index_cache_enabled:
-                    # Publish this batch's top-k so downstream shared-consumer
-                    # layers read it from the stable shared buffer.
+                    # Publish this batch's top-k so downstream skip layers
+                    # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)
-            else:
-                topk_indices = self._get_indexcache_topk_indices(
-                    num_input_tokens or hidden_states.shape[0]
-                )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)

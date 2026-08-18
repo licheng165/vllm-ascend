@@ -1330,6 +1330,13 @@ class TestStagedSFAGraphPoc(TestBase):
         impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         impl._staged_sfa_graph_capture_sizes = (1, 4)
         impl._staged_sfa_bridge_buffers = None
+        # Shared-indexer construction state (GLM-5.2): producers by default.
+        impl.has_indexer = True
+        impl.skip_topk = False
+        impl.topk_indices_buffer = None
+        impl.index_cache_enabled = False
+        impl.use_index_cache = False
+        impl.layer_name = "model.layers.0.self_attn.attn"
         return impl
 
     @staticmethod
@@ -2361,6 +2368,195 @@ class TestStagedSFAGraphPoc(TestBase):
                 "the active connector does not support staged sparse "
                 "selective loads",
             )
+
+    def _eligibility_context(self):
+        forward_context = MagicMock()
+        forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+        forward_context.capturing = False
+        forward_context.staged_sfa_graph_dummy_run = False
+        forward_context.staged_sfa_graph_key = STAGED_SFA_SINGLETON_GRAPH_KEY
+        forward_context.batch_descriptor = BatchDescriptor(
+            num_tokens=1,
+            num_reqs=None,
+            uniform=False,
+        )
+        forward_context.dsa_offload_manager = None
+        forward_context.dsa_adapter_cache = None
+        return forward_context
+
+    def test_shared_consumer_eligible_with_two_latent_planes(self):
+        impl = self._make_eligible_impl()
+        impl.has_indexer = False
+        impl.skip_topk = True
+        impl.topk_indices_buffer = torch.empty(8, 4, dtype=torch.int32)
+        metadata = self._make_decode_metadata()
+        kv_cache = self._make_eligible_kv_cache(dtype=torch.bfloat16)
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=self._eligibility_context(),
+            ),
+            patch.object(
+                sfa_v1,
+                "get_weight_prefetch_method",
+                return_value=None,
+            ),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                kv_cache,
+                metadata,
+            )
+        self.assertIsNone(reason)
+
+        # A producer-style three-plane tuple is not the consumer contract.
+        reason = impl._cross_layer_ineligible_reason(
+            torch.empty(1, 4, dtype=torch.bfloat16),
+            (*kv_cache, kv_cache[0]),
+            metadata,
+        )
+        self.assertIsNotNone(reason)
+
+    def test_shared_consumer_requires_shared_topk_buffer(self):
+        impl = self._make_eligible_impl()
+        impl.has_indexer = False
+        impl.skip_topk = True
+        impl.topk_indices_buffer = None
+        metadata = self._make_decode_metadata()
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=self._eligibility_context(),
+            ),
+            patch.object(
+                sfa_v1,
+                "get_weight_prefetch_method",
+                return_value=None,
+            ),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(dtype=torch.bfloat16),
+                metadata,
+            )
+        self.assertEqual(
+            reason,
+            "the shared-consumer staged graph requires the shared top-k buffer",
+        )
+
+    def test_producer_requires_indexer_plane(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        latent_only = self._make_eligible_kv_cache(dtype=torch.bfloat16)[:2]
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=self._eligibility_context(),
+            ),
+            patch.object(
+                sfa_v1,
+                "get_weight_prefetch_method",
+                return_value=None,
+            ),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                latent_only,
+                metadata,
+            )
+        self.assertIsNotNone(reason)
+
+    def test_capture_binding_seals_shared_topk_buffer(self):
+        impl = self._make_eligible_impl()
+        impl.index_cache_enabled = True
+        state = impl._staged_sfa_capture_state
+        state.producer_event = object()
+        state.remap_boundary = torch.empty(1, dtype=torch.int32)
+        bridge = self._make_pre_outputs()
+        kv_cache = self._make_eligible_kv_cache()
+        key_a = MagicMock()
+        key_b = MagicMock()
+
+        buffer_one = torch.empty(8, 4, dtype=torch.int32)
+        buffer_two = torch.empty(8, 4, dtype=torch.int32)
+        state.register(key_a, bridge, kv_cache, topk_buffer=buffer_one)
+        with self.assertRaisesRegex(RuntimeError, "capture bindings changed between graph keys"):
+            state.register(key_b, bridge, kv_cache, topk_buffer=buffer_two)
+        # The same buffer keeps the contract stable.
+        state.register(key_b, bridge, kv_cache, topk_buffer=buffer_one)
+        # And omitting it after sealing one is also a change.
+        key_c = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "capture bindings changed between graph keys"):
+            state.register(key_c, bridge, kv_cache, topk_buffer=None)
+
+    def test_indexcache_buffer_roundtrip_helpers(self):
+        impl = self._make_eligible_impl()
+        impl.topk_indices_buffer = torch.zeros(8, 4, dtype=torch.int32)
+
+        produced = torch.arange(8, dtype=torch.int32).view(8, 1, 1).expand(8, 1, 4)
+        impl._update_indexcache_topk_indices(produced.contiguous())
+        read_back = impl._get_indexcache_topk_indices(8)
+        self.assertEqual(read_back.shape, (8, 1, 4))
+        self.assertTrue(torch.equal(read_back, produced))
+
+        # 2-D buffer rows are unsqueezed to the 3-D kernel layout.
+        impl.topk_indices_buffer = torch.zeros(8, 4, dtype=torch.int32)
+        produced_2d = torch.ones(8, 4, dtype=torch.int32)
+        impl._update_indexcache_topk_indices(produced_2d)
+        self.assertEqual(impl._get_indexcache_topk_indices(8).shape, (8, 1, 4))
+
+        # No buffer configured: update is a no-op, read fails closed.
+        impl.topk_indices_buffer = None
+        impl._update_indexcache_topk_indices(produced_2d)
+        with self.assertRaisesRegex(RuntimeError, "topk_indices_buffer"):
+            impl._get_indexcache_topk_indices(8)
+
+    def test_shared_indexer_reuse_map_prefers_preceding_producer(self):
+        # The reuse map is derived from indexer_types; consumers must map to
+        # the nearest PRECEDING full producer.
+        import io
+        import logging
+
+        indexer_types = ["full", "full", "shared", "shared", "full", "shared"]
+        config = SimpleNamespace(indexer_types=indexer_types)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = sfa_v1.logger
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        try:
+            sfa_v1._log_shared_indexer_reuse_map((config,), "model.layers.0.self_attn.attn")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+        message = stream.getvalue()
+        self.assertIn("producers=[0, 1, 4]", message)
+        self.assertIn("consumers=[2, 3, 5]", message)
+        self.assertIn("'2': 1", message)
+        self.assertIn("'3': 1", message)
+        self.assertIn("'5': 4", message)
 
     def test_eligibility_accepts_exact_multi_request_q1_batch(self):
         batch_size = 4
