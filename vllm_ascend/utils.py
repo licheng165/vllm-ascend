@@ -1539,3 +1539,18 @@ def parse_layer_idx(prefix: str) -> int | None:
     """Extract the layer index from a module prefix string like 'model.layers.0.self_attn'."""
     match = re.search(r"layers\.(\d+)", prefix)
     return int(match.group(1)) if match else None
+
+
+def sparse_kv_cache_has_indexer(kv_cache_spec) -> bool:
+    """Whether a sparse MLA KV cache spec owns an indexer key plane.
+
+    Shared-indexer consumer layers (GLM-5.2 ``indexer_types``) register a
+    latent-only spec whose ``sparse_head_dim`` third entry is 0, so they must
+    not allocate or reshape an indexer cache plane.
+    """
+    sparse_head_dim = getattr(kv_cache_spec, "sparse_head_dim", None)
+    return (
+        sparse_head_dim is not None
+        and len(sparse_head_dim) == 3
+        and sparse_head_dim[2] > 0
+    )
