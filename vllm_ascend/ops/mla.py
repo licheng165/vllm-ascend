@@ -101,6 +101,13 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             ascend_indexer = IndexerWrapper(mla_modules.indexer)
         else:
             ascend_indexer = None
+        # Shared-indexer (GLM-5.2): IndexerWrapper drops the original Indexer's
+        # topk_indices_buffer, so the shared buffer must be captured from
+        # mla_modules (which holds an independent reference) and passed to the
+        # SFA impl explicitly. Shared-consumer layers (indexer=None, skip_topk)
+        # reach the producer-written buffer only through this path.
+        self.skip_topk = mla_modules.skip_topk
+        self.topk_indices_buffer = mla_modules.topk_indices_buffer
         self.mla_attn = MLAAttention(
             num_heads=num_heads,
             scale=scale,
@@ -115,6 +122,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             prefix=f"{prefix}.attn",
             use_sparse=mla_modules.is_sparse,
             indexer=ascend_indexer,
+            topk_indices_buffer=self.topk_indices_buffer,
+            skip_topk=self.skip_topk,
             # extra args
             rotary_emb=mla_modules.rotary_emb,
             fused_qkv_a_proj=mla_modules.fused_qkv_a_proj,
