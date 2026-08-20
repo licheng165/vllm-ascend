@@ -2534,29 +2534,28 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_shared_indexer_reuse_map_prefers_preceding_producer(self):
         # The reuse map is derived from indexer_types; consumers must map to
-        # the nearest PRECEDING full producer.
-        import io
-        import logging
+        # the nearest PRECEDING full producer. logger.info_once deduplicates
+        # via lru_cache over (msg, *args), so every arg must also be hashable
+        # (regression test for the unhashable-list startup crash) and free of
+        # per-layer values (otherwise every layer would emit its own copy).
+        captured = []
+
+        def fake_info_once(msg, *args, scope="process"):
+            captured.append((msg, args))
 
         indexer_types = ["full", "full", "shared", "shared", "full", "shared"]
         config = SimpleNamespace(indexer_types=indexer_types)
-        stream = io.StringIO()
-        handler = logging.StreamHandler(stream)
-        logger = sfa_v1.logger
-        old_level = logger.level
-        logger.setLevel(logging.INFO)
-        logger.addHandler(handler)
-        try:
-            sfa_v1._log_shared_indexer_reuse_map((config,), "model.layers.0.self_attn.attn")
-        finally:
-            logger.removeHandler(handler)
-            logger.setLevel(old_level)
-        message = stream.getvalue()
-        self.assertIn("producers=[0, 1, 4]", message)
-        self.assertIn("consumers=[2, 3, 5]", message)
-        self.assertIn("'2': 1", message)
-        self.assertIn("'3': 1", message)
-        self.assertIn("'5': 4", message)
+        with patch.object(sfa_v1.logger, "info_once", fake_info_once):
+            sfa_v1._log_shared_indexer_reuse_map((config,))
+
+        self.assertEqual(len(captured), 1)
+        msg, args = captured[0]
+        for arg in args:
+            hash(arg)
+        formatted = msg % args
+        self.assertIn("producers=(0, 1, 4)", formatted)
+        self.assertIn("consumers=(2, 3, 5)", formatted)
+        self.assertIn("source_producer_per_consumer={2: 1, 3: 1, 5: 4}", formatted)
 
     def test_eligibility_accepts_exact_multi_request_q1_batch(self):
         batch_size = 4

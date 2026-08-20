@@ -176,16 +176,18 @@ def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
     return False
 
 
-def _log_shared_indexer_reuse_map(
-    configs: tuple[Any, ...],
-    layer_name: str,
-) -> None:
+def _log_shared_indexer_reuse_map(configs: tuple[Any, ...]) -> None:
     """Log the frozen consumer->producer top-k reuse map once per process.
 
     The mapping is derived from indexer_types: every consumer reads the
     nearest PRECEDING full producer. This is the reuse contract the staged
     graphs rely on (producer graph A publishes the shared buffer before any
     consumer graph A in the same batch reads it).
+
+    NOTE: logger.info_once deduplicates via lru_cache over (msg, *args), so
+    every arg must be hashable (tuples/strings, never lists/dicts) and must
+    NOT include per-layer values (e.g. layer_name), otherwise each layer
+    would emit its own copy.
     """
     indexer_types = _get_indexer_types(configs)
     if indexer_types is None:
@@ -204,12 +206,10 @@ def _log_shared_indexer_reuse_map(
             consumers.append((index, last_producer))
     logger.info_once(
         "DSA shared-indexer reuse map (derived from indexer_types): "
-        "producers=%s consumers=%s source_producer_per_consumer=%s "
-        "(logged from %s)",
-        producer_layers,
-        [consumer for consumer, _ in consumers],
-        {consumer: producer for consumer, producer in consumers},
-        layer_name,
+        "producers=%s consumers=%s source_producer_per_consumer=%s",
+        tuple(producer_layers),
+        tuple(consumer for consumer, _ in consumers),
+        str({consumer: producer for consumer, producer in consumers}),
         scope="local",
     )
 
@@ -1867,8 +1867,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             "use_index_cache",
         ) or _has_shared_indexer_layers(config_candidates)
         self.use_index_cache = self.skip_topk or self.index_cache_enabled
-        if self.index_cache_enabled and self.layer_name is not None:
-            _log_shared_indexer_reuse_map(config_candidates, self.layer_name)
+        if self.index_cache_enabled:
+            _log_shared_indexer_reuse_map(config_candidates)
 
         # indexer param
         if self.has_indexer:
