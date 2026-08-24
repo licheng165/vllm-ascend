@@ -2532,6 +2532,90 @@ class TestStagedSFAGraphPoc(TestBase):
         with self.assertRaisesRegex(RuntimeError, "topk_indices_buffer"):
             impl._get_indexcache_topk_indices(8)
 
+    def test_shared_consumer_native_uses_local_hidden_state_rows(self):
+        local_rows = 512
+        padded_rows = 4096
+        impl = self._make_eligible_impl()
+        impl.has_indexer = False
+        impl.skip_topk = True
+        impl.topk_indices_buffer = torch.zeros(padded_rows, 4, dtype=torch.int32)
+        impl.dsa_offload_unbundle = False
+        impl.is_kv_producer = False
+        impl.dsa_shrink_latent = 0
+        impl.enable_dsa_cp = True
+        impl.enable_dsa_cp_strict_accuracy = False
+
+        impl.fused_qkv_a_proj = MagicMock()
+        impl.fused_qkv_a_proj.weight = torch.empty(1)
+        impl.fused_qkv_a_proj.return_value = (
+            torch.empty(local_rows, impl.q_lora_rank + impl.kv_lora_rank + impl.qk_rope_head_dim),
+        )
+        impl.q_a_layernorm = MagicMock(side_effect=lambda value: value)
+        impl.exec_kv = MagicMock(
+            return_value=(
+                torch.empty(local_rows, 1, impl.qk_rope_head_dim),
+                torch.empty(local_rows, 1, impl.kv_lora_rank),
+            )
+        )
+        impl._q_proj_and_k_up_proj = MagicMock(
+            return_value=(
+                torch.empty(local_rows, 1, 2),
+                torch.empty(local_rows, 1, impl.qk_rope_head_dim),
+            )
+        )
+        impl.rope_single = MagicMock(side_effect=lambda value, cos, sin: value)
+        impl._execute_sparse_flash_attention_process = MagicMock(
+            return_value=torch.empty(local_rows, 1, 2)
+        )
+        impl._v_up_proj = MagicMock(side_effect=lambda value: value)
+        impl.o_proj = MagicMock(return_value=(torch.empty(local_rows, 4),))
+        impl.o_proj.weight = torch.empty(1)
+        impl._submit_sfa_save_operations = MagicMock()
+
+        metadata = SimpleNamespace(
+            cos=torch.ones(local_rows, 2),
+            sin=torch.zeros(local_rows, 2),
+            slot_mapping=torch.arange(local_rows),
+            indexer_slot_mapping=None,
+            cum_query_lens=torch.tensor([0, local_rows]),
+            seq_lens=torch.tensor([local_rows]),
+            num_input_tokens=padded_rows,
+            num_actual_tokens=local_rows,
+            num_decode_tokens=0,
+            attn_state=AscendAttentionState.ChunkedPrefill,
+            split_boundary=None,
+            dsa_cp_context=SimpleNamespace(
+                slot_mapping_cp=torch.arange(local_rows),
+                actual_seq_lengths_query=torch.tensor([0, local_rows]),
+                actual_seq_lengths_key=torch.tensor([local_rows]),
+            ),
+        )
+        hidden_states = torch.empty(local_rows, 4)
+        output = torch.empty_like(hidden_states)
+        kv_cache = (
+            torch.empty(1, 128, 1, impl.kv_lora_rank),
+            torch.empty(1, 128, 1, impl.qk_rope_head_dim),
+        )
+        context = SimpleNamespace(dsa_offload_manager=None, dsa_adapter_cache=None)
+        prefetch = MagicMock()
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(sfa_v1, "get_weight_prefetch_method", return_value=prefetch),
+            patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),
+            patch.object(sfa_v1, "get_tp_group", return_value=MagicMock()),
+            patch.object(
+                sfa_v1,
+                "all_gather_async",
+                side_effect=lambda tensor, group, **kwargs: (tensor, None),
+            ),
+            patch.object(sfa_v1.DeviceOperator, "reshape_and_cache"),
+        ):
+            impl.forward("model.layers.1.self_attn.attn", hidden_states, kv_cache, metadata, output=output)
+
+        sparse_indices = impl._execute_sparse_flash_attention_process.call_args.args[3]
+        self.assertEqual(sparse_indices.shape, (local_rows, 1, 4))
+
     def test_shared_indexer_reuse_map_prefers_preceding_producer(self):
         # The reuse map is derived from indexer_types; consumers must map to
         # the nearest PRECEDING full producer. logger.info_once deduplicates

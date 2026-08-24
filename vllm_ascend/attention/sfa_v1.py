@@ -4420,7 +4420,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # GLM-5.2 shared consumers (no local Indexer) and runtime
                 # IndexCache skip layers (GLM-5.1, indexer still present).
                 topk_indices = self._get_indexcache_topk_indices(
-                    num_input_tokens or hidden_states.shape[0]
+                    hidden_states.shape[0]
                 )
             else:
                 if not self.has_indexer:
