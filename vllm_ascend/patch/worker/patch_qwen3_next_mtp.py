@@ -38,9 +38,18 @@ def bind_kv_cache(
 
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
-        # remove some codes for the typical case of encoder-decoder model, e.g., bart.
-        layer_name = layer_names[0]
-        runner_kv_caches.append(kv_caches[layer_name])
+        selected_names = layer_names[:1]
+        # DSA exposes an exact latent/indexer sibling pair per producer layer.
+        # Keep the original collapsed behavior for every other duplicate index.
+        if len(layer_names) == 2:
+            primary_names = [layer_name for layer_name in layer_names if layer_name.endswith(".self_attn.attn")]
+            if len(primary_names) == 1:
+                primary_name = primary_names[0]
+                indexer_name = primary_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                if indexer_name in layer_names:
+                    selected_names = [primary_name, indexer_name]
+        for layer_name in selected_names:
+            runner_kv_caches.append(kv_caches[layer_name])
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
