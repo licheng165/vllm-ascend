@@ -20,6 +20,9 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
     is_v1_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    LayerwisePrefillCallbackMetadata,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
@@ -66,10 +69,12 @@ from vllm_ascend.attention.utils import (
     enable_cp,
     get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
+    save_layerwise_prefill_to_connector,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
+    wait_for_layerwise_prefill_from_connector,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
@@ -979,6 +984,9 @@ class AscendSFAMetadata:
     # None in single-group mode (indexer shares the latent's block ids).
     indexer_block_table: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    layerwise_prefill_callback_metadata: tuple[
+        LayerwisePrefillCallbackMetadata, ...
+    ] = ()
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
     num_decodes: int = 0
@@ -1691,6 +1699,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             indexer_block_table=indexer_block_table,
             indexer_slot_mapping=indexer_slot_mapping,
+            layerwise_prefill_callback_metadata=getattr(
+                common_attn_metadata,
+                "layerwise_prefill_callback_metadata",
+                (),
+            ),
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -3017,6 +3030,81 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_caches,
             )
 
+    def _wait_for_layerwise_prefill_rows(
+        self,
+        layer_name: str,
+        attn_metadata: AscendSFAMetadata,
+    ) -> tuple[LayerwisePrefillCallbackMetadata, ...]:
+        callbacks = getattr(
+            attn_metadata,
+            "layerwise_prefill_callback_metadata",
+            (),
+        )
+        if not callbacks:
+            return ()
+        execution = callbacks[0].execution
+        expected_rows = (execution.latent,)
+        if execution.indexer is not None:
+            expected_rows += (execution.indexer,)
+        if (
+            execution.latent.layer_name != layer_name
+            or tuple(callback.row for callback in callbacks) != expected_rows
+            or any(callback.execution != execution for callback in callbacks)
+        ):
+            raise RuntimeError(
+                "Layerwise-prefill callback metadata does not match the "
+                f"canonical SFA execution for {layer_name!r}."
+            )
+        wait_for_layerwise_prefill_from_connector(callbacks)
+        return callbacks
+
+    def _save_layerwise_prefill_rows(
+        self,
+        callbacks: tuple[LayerwisePrefillCallbackMetadata, ...],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendSFAMetadata,
+    ) -> None:
+        for callback in callbacks:
+            row = callback.row
+            if row.kv_group == 0:
+                if row != callback.execution.latent or len(kv_cache) < 2:
+                    raise RuntimeError(
+                        "Layerwise-prefill LATENT callback has no matching KV "
+                        "planes."
+                    )
+                kv_layer = [kv_cache[0], kv_cache[1]]
+            elif row.kv_group == 1:
+                if (
+                    row != callback.execution.indexer
+                    or not self.has_indexer
+                    or len(kv_cache) < 3
+                ):
+                    raise RuntimeError(
+                        "Layerwise-prefill INDEXER callback has no matching "
+                        "producer KV plane."
+                    )
+                kv_layer = [kv_cache[2]]
+            else:
+                raise RuntimeError(
+                    f"Unsupported layerwise-prefill KV group {row.kv_group}."
+                )
+            save_layerwise_prefill_to_connector(
+                callback,
+                kv_layer,
+                attn_metadata,
+            )
+
+    def _record_reshape_cache_event(
+        self,
+        kv_cache: tuple[torch.Tensor, ...] | None,
+        attn_metadata: AscendSFAMetadata,
+    ) -> None:
+        if kv_cache is None or not self.is_kv_producer:
+            return
+        if attn_metadata.reshape_cache_event is None:
+            raise RuntimeError("Producer KV reshape event was not initialized.")
+        attn_metadata.reshape_cache_event.record()
+
     def _prepare_sorted_resident_sparse_cache(
         self,
         topk_indices: torch.Tensor,
@@ -4148,8 +4236,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        layerwise_prefill_metadata = getattr(
+            attn_metadata,
+            "layerwise_prefill_callback_metadata",
+            (),
+        )
+        if layerwise_prefill_metadata and self.enable_dsa_cp_with_o_proj_tp:
+            raise RuntimeError(
+                "Layerwise-prefill P-node callbacks are incompatible with the "
+                "SFA context-parallel o_proj path."
+            )
         _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
+        layerwise_prefill_callbacks = self._wait_for_layerwise_prefill_rows(
+            layer_name,
+            attn_metadata,
+        )
         _is_pure_decode = attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
@@ -4157,10 +4259,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         _sparse_indices_padding_zeroed = False
         # Shared-indexer consumers have no sibling indexer cache registered;
         # only producer layers can resolve (and later save) the sibling name.
-        index_layer_name = (
-            _dsa_indexer_layer_name(layer_name)
-            if self.dsa_offload_unbundle and self.has_indexer
+        canonical_indexer = (
+            layerwise_prefill_callbacks[0].execution.indexer
+            if layerwise_prefill_callbacks
             else None
+        )
+        index_layer_name = (
+            canonical_indexer.layer_name
+            if canonical_indexer is not None
+            else (
+                _dsa_indexer_layer_name(layer_name)
+                if self.dsa_offload_unbundle and self.has_indexer
+                else None
+            )
         )
         index_lmcache_enabled = (
             self.dsa_offload_unbundle and index_layer_name is not None and _dsa_index_lmcache_enabled()
@@ -4255,7 +4366,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+            if not layerwise_prefill_callbacks and not (
+                self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0
+            ):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -4393,7 +4506,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            if index_lmcache_enabled:
+            if index_lmcache_enabled and not layerwise_prefill_callbacks:
                 # A cold shared-cache decode needs prompt index rows before
                 # top-k selection. The group-1 wait is a no-op when resident
                 # and does not advance the group-0 latent-layer cursor.
@@ -4411,8 +4524,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     idx_slot_mapping.view(-1, 1),
                     k_li_scale.view(-1, k_li_scale.shape[-1]),
                 )
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event.record()
+        self._record_reshape_cache_event(kv_cache, attn_metadata)
 
         with _dsa_prof.section("indexer"):
             if self.skip_topk:
@@ -5200,6 +5312,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
+        if layerwise_prefill_callbacks:
+            self._save_layerwise_prefill_rows(
+                layerwise_prefill_callbacks,
+                kv_cache,
+                attn_metadata,
+            )
+
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -5235,6 +5354,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
         output[...] = self.o_proj(attn_output)[0]
+
+        if layerwise_prefill_callbacks:
+            _dsa_prof.end(_sfa_t)
+            return output_padded
 
         # Offload to LMCache. Legacy un-bundled connectors save only the latent
         # (k_nope, k_pe). Connectors declaring DSA index LMCache support also

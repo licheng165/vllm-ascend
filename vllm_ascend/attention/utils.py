@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    LayerwisePrefillCallbackMetadata,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -215,6 +218,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # separate groups). None in single-group mode.
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    layerwise_prefill_callback_metadata: tuple[
+        LayerwisePrefillCallbackMetadata, ...
+    ] = ()
     # DSA shrink-latent: per-request prompt lengths (CPU, length num_reqs); the
     # SFA builder expands them per ROW (decode rows -> plen, prefill/padding
     # rows -> 0 = no remap).
@@ -246,6 +252,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -253,6 +261,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            layerwise_prefill_callback_metadata=(
+                self.layerwise_prefill_callback_metadata
+            ),
             max_seq_len=self.max_seq_len,
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
@@ -695,6 +706,53 @@ def maybe_save_kv_layer_to_connector(
             layer_name,
             type(connector).__name__,
         )
+
+
+def _get_layerwise_prefill_p_node_connector():
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        raise RuntimeError(
+            "Layerwise-prefill P-node callback requires a v1 KV connector."
+        )
+    connector = get_kv_transfer_group()
+    if getattr(connector, "supports_layerwise_prefill_p_node", False) is not True:
+        raise RuntimeError(
+            "The active KV connector stopped supporting the complete "
+            "layerwise-prefill P-node protocol."
+        )
+    return connector
+
+
+def wait_for_layerwise_prefill_from_connector(
+    callbacks: tuple[LayerwisePrefillCallbackMetadata, ...],
+) -> None:
+    """Synchronously wait for canonical rows before one eager SFA layer."""
+
+    if not callbacks:
+        return
+    connector = _get_layerwise_prefill_p_node_connector()
+    wait = getattr(connector, "wait_for_layerwise_prefill_load", None)
+    if not callable(wait):
+        raise RuntimeError(
+            "Layerwise-prefill P-node connector has no synchronous wait callback."
+        )
+    for callback in callbacks:
+        wait(callback)
+
+
+def save_layerwise_prefill_to_connector(
+    callback: LayerwisePrefillCallbackMetadata,
+    kv_layer: Any,
+    attn_metadata: Any,
+) -> None:
+    """Synchronously save one canonical row after one eager SFA layer."""
+
+    connector = _get_layerwise_prefill_p_node_connector()
+    save = getattr(connector, "save_layerwise_prefill_kv_layer", None)
+    if not callable(save):
+        raise RuntimeError(
+            "Layerwise-prefill P-node connector has no synchronous save callback."
+        )
+    save(callback, kv_layer, attn_metadata)
 
 
 def round_up(val: int, align: int) -> int:

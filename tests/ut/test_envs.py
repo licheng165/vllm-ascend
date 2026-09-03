@@ -38,7 +38,9 @@ class TestEnvVariables(TestBase):
                                      var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if 'bool(int(' in handler_source:
+                    if var_name == "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE":
+                        test_vals = ["true", "false"]
+                    elif 'bool(int(' in handler_source:
                         test_vals = ["0", "1"]
                     elif 'int(' in handler_source:
                         test_vals = ["123", "456"]
@@ -97,3 +99,16 @@ class TestEnvVariables(TestBase):
             self.assertFalse(getattr(envs_ascend, name))
         with patch.dict(os.environ, {name: "1"}):
             self.assertTrue(getattr(envs_ascend, name))
+
+    def test_layerwise_prefill_p_node_uses_strict_boolean_spelling(self):
+        name = "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: " TrUe "}):
+            self.assertTrue(getattr(envs_ascend, name))
+        with (
+            patch.dict(os.environ, {name: "1"}),
+            self.assertRaisesRegex(ValueError, "must be 'true' or 'false'"),
+        ):
+            getattr(envs_ascend, name)

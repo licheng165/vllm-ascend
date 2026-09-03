@@ -210,6 +210,46 @@ class TestNPUPlatform(TestBase):
 
         self.assertEqual(observed_inputs, [77])
 
+    @patch("vllm_ascend.platform.refresh_block_size")
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.platform.enable_sp", return_value=False)
+    @patch("vllm_ascend.ascend_config.init_ascend_config")
+    @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
+    def test_layerwise_prefill_p_node_rejects_piecewise_graphs(
+        self,
+        mock_auto_detect,
+        mock_init_ascend,
+        _mock_enable_sp,
+        _mock_device_type,
+        _mock_refresh_block_size,
+    ):
+        mock_init_ascend.return_value = TestNPUPlatform.mock_vllm_ascend_config()
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.scheduler_config.max_num_seqs = 1
+        vllm_config.compilation_config.max_cudagraph_capture_size = 1
+        vllm_config.compilation_config.cudagraph_capture_sizes = [1]
+        vllm_config.compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.compilation_config.custom_ops = []
+        vllm_config.model_config.enforce_eager = False
+        vllm_config.model_config.enable_sleep_mode = True
+        vllm_config.model_config.is_encoder_decoder = False
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.worker_cls = "manual"
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+        vllm_config.cache_config.block_size = 1
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "true"},
+            ),
+            pytest.raises(ValueError, match="requires eager execution"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
     def test_get_device_capability(self):
         self.assertIsNone(self.platform.get_device_capability(device_id=0))
 

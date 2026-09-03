@@ -47,6 +47,7 @@ class NPUInputBatch(InputBatch):
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
+        layerwise_prefill_p_node: bool = False,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -103,6 +104,23 @@ class NPUInputBatch(InputBatch):
             kernel_sizes=kernel_block_sizes,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
+        self.layerwise_prefill_block_tables = (self.block_table,)
+        if layerwise_prefill_p_node:
+            self.layerwise_prefill_block_tables = (
+                self.block_table,
+                MultiGroupBlockTable(
+                    max_num_reqs=max_num_reqs,
+                    max_model_len=max_model_len,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    pin_memory=pin_memory,
+                    device=device,
+                    block_sizes=block_sizes,
+                    max_num_blocks=max_num_blocks_per_req,
+                    num_speculative_tokens=num_speculative_tokens,
+                    kernel_sizes=kernel_block_sizes,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                ),
+            )
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)

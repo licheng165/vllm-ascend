@@ -221,6 +221,19 @@ class SpecDecodeBaseProposer(EagleProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ]
+        self.indexer_slot_mapping_group = (
+            [
+                torch.zeros(
+                    slot_mapping_lens,
+                    dtype=torch.int32,
+                    device=device,
+                    pin_memory=self.runner.pin_memory,
+                )
+                for _ in range(self.num_speculative_tokens)
+            ]
+            if getattr(self.runner, "layerwise_prefill_p_node", False)
+            else []
+        )
         self._staged_mtp_metadata_arenas: list[
             _DraftStepMetadataArena
         ] = []
@@ -1313,6 +1326,32 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        layerwise_callbacks = getattr(
+            common_attn_metadata,
+            "layerwise_prefill_callback_metadata",
+            (),
+        )
+        if layerwise_callbacks:
+            indexer_slot_mapping = getattr(
+                common_attn_metadata,
+                "indexer_slot_mapping",
+                None,
+            )
+            if indexer_slot_mapping is None or not self.indexer_slot_mapping_group:
+                raise RuntimeError(
+                    "Layerwise-prefill MTP metadata has no per-step INDEXER "
+                    "slot storage."
+                )
+            indexer_slot_mapping_lens = indexer_slot_mapping.shape[0]
+            self.indexer_slot_mapping_group[0][
+                :indexer_slot_mapping_lens
+            ].copy_(indexer_slot_mapping[:indexer_slot_mapping_lens])
+            self.indexer_slot_mapping_group[0][
+                indexer_slot_mapping_lens:
+            ].fill_(PADDING_SLOT_ID)
+            common_attn_metadata.indexer_slot_mapping = (
+                self.indexer_slot_mapping_group[0]
+            )
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
@@ -2048,6 +2087,56 @@ class SpecDecodeBaseProposer(EagleProposer):
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
 
+            layerwise_callbacks = getattr(
+                old_common_metadata,
+                "layerwise_prefill_callback_metadata",
+                (),
+            )
+            if layerwise_callbacks:
+                indexer_block_table = getattr(
+                    old_common_metadata,
+                    "indexer_block_table_tensor",
+                    None,
+                )
+                if (
+                    indexer_block_table is None
+                    or draft_step >= len(self.indexer_slot_mapping_group)
+                ):
+                    raise RuntimeError(
+                        "Layerwise-prefill MTP metadata has incomplete INDEXER "
+                        "block mapping."
+                    )
+                indexer_slot_mapping = self.indexer_slot_mapping_group[
+                    draft_step
+                ]
+                indexer_block_ids = indexer_block_table.gather(
+                    dim=1,
+                    index=block_numbers.view(-1, 1),
+                ).view(-1)
+                if self.uses_mrope:
+                    indexer_slots = (
+                        indexer_block_ids * block_size
+                        + clamped_positions[0] % block_size
+                    )
+                else:
+                    indexer_slots = (
+                        indexer_block_ids * block_size
+                        + clamped_positions % block_size
+                    )
+                indexer_slots.masked_fill_(
+                    exceeds_max_model_len,
+                    PADDING_SLOT_ID,
+                )
+                indexer_slot_mapping[: indexer_slots.shape[0]].copy_(
+                    indexer_slots.to(torch.int32)
+                )
+                indexer_slot_mapping[indexer_slots.shape[0] :].fill_(
+                    PADDING_SLOT_ID
+                )
+                common_attn_metadata.indexer_slot_mapping = (
+                    indexer_slot_mapping
+                )
+
         attn_metadata_builder = attn_group.get_metadata_builder()
 
         attn_metadata = attn_metadata_builder.build_for_drafting(
@@ -2207,6 +2296,16 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        indexer_slot_mapping = getattr(
+            common_attn_metadata,
+            "indexer_slot_mapping",
+            None,
+        )
+        if indexer_slot_mapping is not None:
+            indexer_slot_mapping[: token_indices.shape[0]].copy_(
+                indexer_slot_mapping[token_indices]
+            )
+            indexer_slot_mapping[token_indices.shape[0] :].fill_(-1)
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -2223,6 +2322,17 @@ class SpecDecodeBaseProposer(EagleProposer):
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=indexer_slot_mapping,
+            layerwise_prefill_callback_metadata=getattr(
+                common_attn_metadata,
+                "layerwise_prefill_callback_metadata",
+                (),
+            ),
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             positions=common_attn_metadata.positions[token_indices],
             attn_state=self.runner.attn_state,
@@ -2302,6 +2412,21 @@ class SpecDecodeBaseProposer(EagleProposer):
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=getattr(
+                common_attn_metadata,
+                "indexer_slot_mapping",
+                None,
+            ),
+            layerwise_prefill_callback_metadata=getattr(
+                common_attn_metadata,
+                "layerwise_prefill_callback_metadata",
+                (),
+            ),
             positions=common_attn_metadata.positions,
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,

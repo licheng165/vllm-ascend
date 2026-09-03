@@ -300,6 +300,16 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
+        if (
+            envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE currently requires eager "
+                "execution (cudagraph_mode=NONE); PIECEWISE P-node address and "
+                "callback semantics are deferred to Stage 8."
+            )
+
         if ascend_config.xlite_graph_config.enabled:
             if ascend_config.xlite_graph_config.full_mode:
                 logger.info("ACLGraph is disabled under xlite full mode")
@@ -354,6 +364,16 @@ class NPUPlatform(Platform):
         # TODO: Full graph is fully supported later, and the default value will be set to full graph.
         if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+        if (
+            envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE currently requires eager "
+                "execution (cudagraph_mode=NONE); PIECEWISE P-node address and "
+                "callback semantics are deferred to Stage 8."
+            )
 
         # encoder-decoder models currently only support piecewise mode
         if model_config and model_config.is_encoder_decoder is True:
