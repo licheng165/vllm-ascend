@@ -910,7 +910,15 @@ class NPUModelRunner(GPUModelRunner):
         if getattr(connector, "supports_layerwise_prefill_p_node", False) is not True:
             raise RuntimeError(
                 "The active KV connector does not support the complete "
-                "layerwise-prefill P-node protocol."
+                "layerwise-prefill P-node protocol: connector="
+                f"{type(connector).__name__}, eager_callbacks="
+                f"{getattr(connector, 'supports_layerwise_prefill_eager_callbacks', False)}, "
+                "indexer_persistence="
+                f"{getattr(connector, 'supports_dsa_index_lmcache', False)}, "
+                "transfer_window="
+                f"{getattr(connector, 'supports_layerwise_prefill_transfer_window', False)}. "
+                "Check that the deployed LMCache and LMCache-Ascend builds "
+                "provide the layerwise-prefill P-node capabilities."
             )
         if not callable(
             getattr(connector, "wait_for_layerwise_prefill_load", None)
