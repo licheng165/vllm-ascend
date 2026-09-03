@@ -334,12 +334,14 @@ class NPUPlatform(Platform):
 
         if (
             envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
-            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and compilation_config.cudagraph_mode
+            in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
         ):
             raise ValueError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE currently requires eager "
-                "execution (cudagraph_mode=NONE); PIECEWISE P-node address and "
-                "callback semantics are deferred to Stage 8."
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE rejects FULL and "
+                "FULL_DECODE_ONLY graph modes: full-model replay bypasses the "
+                "per-layer transfer-window callbacks. Use eager mode or "
+                "PIECEWISE with the fixed-address P-node buffers."
             )
 
         if envs_ascend.VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE:
@@ -402,12 +404,14 @@ class NPUPlatform(Platform):
 
         if (
             envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
-            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and compilation_config.cudagraph_mode
+            in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
         ):
             raise ValueError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE currently requires eager "
-                "execution (cudagraph_mode=NONE); PIECEWISE P-node address and "
-                "callback semantics are deferred to Stage 8."
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE rejects FULL and "
+                "FULL_DECODE_ONLY graph modes: full-model replay bypasses the "
+                "per-layer transfer-window callbacks. Use eager mode or "
+                "PIECEWISE with the fixed-address P-node buffers."
             )
 
         # encoder-decoder models currently only support piecewise mode

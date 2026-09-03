@@ -215,7 +215,7 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
-    def test_layerwise_prefill_p_node_rejects_piecewise_graphs(
+    def test_layerwise_prefill_p_node_rejects_full_graph_modes(
         self,
         mock_auto_detect,
         mock_init_ascend,
@@ -229,7 +229,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.compilation_config.max_cudagraph_capture_size = 1
         vllm_config.compilation_config.cudagraph_capture_sizes = [1]
         vllm_config.compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         vllm_config.compilation_config.custom_ops = []
         vllm_config.model_config.enforce_eager = False
         vllm_config.model_config.enable_sleep_mode = True
@@ -246,7 +246,7 @@ class TestNPUPlatform(TestBase):
                 "os.environ",
                 {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "true"},
             ),
-            pytest.raises(ValueError, match="requires eager execution"),
+            pytest.raises(ValueError, match="rejects FULL"),
         ):
             self.platform.check_and_update_config(vllm_config)
 

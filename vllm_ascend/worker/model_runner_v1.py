@@ -812,6 +812,62 @@ class NPUModelRunner(GPUModelRunner):
                 f"primary allocation: request_id={request_id}."
             )
 
+    def _layerwise_prefill_table_addresses(
+        self,
+    ) -> tuple[tuple[tuple[int, int], ...], ...]:
+        tables = getattr(
+            self.input_batch,
+            "layerwise_prefill_block_tables",
+            None,
+        )
+        if tables is None:
+            raise RuntimeError(
+                "Layerwise-prefill PIECEWISE requires the fixed per-bank "
+                "block tables."
+            )
+        addresses = []
+        for bank_table in tables:
+            bank_addresses = []
+            for block_table in bank_table.block_tables:
+                slot = block_table.slot_mapping.gpu
+                device_tensor = block_table.get_device_tensor()
+                bank_addresses.append(
+                    (
+                        slot.data_ptr(),
+                        (
+                            device_tensor.data_ptr()
+                            if device_tensor is not None
+                            else 0
+                        ),
+                    )
+                )
+            addresses.append(tuple(bank_addresses))
+        return tuple(addresses)
+
+    def _validate_layerwise_prefill_piecewise_addresses(self) -> None:
+        """Enforce the PIECEWISE fixed-address guarantee.
+
+        Graph capture bakes the per-bank block-table and slot-mapping
+        addresses into the captured kernels; any later rebind would make
+        replay dereference stale storage. The fixed buffers are recorded
+        once and every refresh must keep their data pointers unchanged.
+        """
+        addresses = self._layerwise_prefill_table_addresses()
+        recorded = getattr(
+            self,
+            "_layerwise_prefill_recorded_addresses",
+            None,
+        )
+        if recorded is None:
+            self._layerwise_prefill_recorded_addresses = addresses
+            return
+        if addresses != recorded:
+            raise RuntimeError(
+                "Layerwise-prefill PIECEWISE fixed-address buffers were "
+                "rebound after capture; graph replay would dereference "
+                "stale addresses."
+            )
+
     def _validate_layerwise_prefill_runtime(
         self,
         topology: DSAKVTopology | None = None,
@@ -819,11 +875,17 @@ class NPUModelRunner(GPUModelRunner):
         if not getattr(self, "layerwise_prefill_p_node", False):
             return None
         self._ensure_layerwise_prefill_p_node_supported()
-        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+        if self.compilation_config.cudagraph_mode in (
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+        ):
             raise RuntimeError(
-                "Layerwise-prefill P-node execution currently requires eager "
-                "mode; PIECEWISE support is deferred to Stage 8."
+                "Layerwise-prefill P-node execution rejects FULL and "
+                "FULL_DECODE_ONLY graph modes: full-model replay bypasses "
+                "the per-layer transfer-window callbacks."
             )
+        if self.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE:
+            self._validate_layerwise_prefill_piecewise_addresses()
         topology = topology or getattr(self, "dsa_kv_topology", None)
         if (
             topology is None

@@ -24,6 +24,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_interface import (
 )
 from vllm_ascend.spec_decode.eagle_proposer import SpecDecodeBaseProposer
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 _PRODUCER_EXECUTIONS = (0, 1, 2, *(6 + 4 * index for index in range(18)), 78)
 
@@ -540,9 +541,52 @@ def test_runtime_rejects_missing_connector_topology_and_piecewise() -> None:
     ):
         runner._validate_layerwise_prefill_runtime()
 
-    runner.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-    with pytest.raises(RuntimeError, match="Stage 8"):
+    runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    with pytest.raises(RuntimeError, match="rejects FULL"):
         runner._validate_layerwise_prefill_runtime()
+
+
+def test_piecewise_fixed_addresses_are_stable_across_refresh() -> None:
+    runner = _runner()
+    input_batch = NPUInputBatch(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=32,
+        block_sizes=[2, 4],
+        kernel_block_sizes=[[2], [4]],
+        max_num_blocks_per_req=[4, 2],
+        layerwise_prefill_p_node=True,
+    )
+    runner.input_batch = input_batch
+
+    runner._validate_layerwise_prefill_piecewise_addresses()
+    runner._validate_layerwise_prefill_piecewise_addresses()
+    # Refresh bank 1 in place: content changes, storage addresses do not.
+    input_batch.layerwise_prefill_block_tables[1].add_row(
+        ([10, 11], [20]),
+        row_idx=0,
+    )
+    runner._validate_layerwise_prefill_piecewise_addresses()
+
+    # A rebind to fresh tables must fail closed.
+    rebound = NPUInputBatch(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=32,
+        block_sizes=[2, 4],
+        kernel_block_sizes=[[2], [4]],
+        max_num_blocks_per_req=[4, 2],
+        layerwise_prefill_p_node=True,
+    )
+    runner.input_batch = rebound
+    with pytest.raises(RuntimeError, match="rebound"):
+        runner._validate_layerwise_prefill_piecewise_addresses()
 
 
 def test_runtime_rejects_a_consumer_only_connector_role() -> None:
