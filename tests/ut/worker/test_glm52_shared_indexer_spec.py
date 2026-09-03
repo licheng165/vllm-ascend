@@ -10,17 +10,23 @@ layers.
 """
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.v1.core.kv_cache_utils import build_dsa_kv_topology
 from vllm.v1.kv_cache_interface import (
+    DSAKVRegistration,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
 )
 
+import vllm_ascend.worker.model_runner_v1 as model_runner_module
 from vllm_ascend.utils import sparse_kv_cache_has_indexer
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -29,13 +35,36 @@ QK_ROPE_HEAD_DIM = 64
 INDEX_HEAD_DIM = 128
 
 
-def _attn_layer(has_indexer: bool) -> MLAAttention:
+def _attn_layer(has_indexer: bool, execution_ordinal: int = 3) -> MLAAttention:
     module = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(module)
     module.impl = SimpleNamespace(has_indexer=has_indexer)
     module.kv_lora_rank = KV_LORA_RANK
     module.qk_rope_head_dim = QK_ROPE_HEAD_DIM
+    module.get_kv_cache_spec = MagicMock(
+        return_value=MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+            dtype=torch.float32,
+            dsa_kv_registration=DSAKVRegistration(execution_ordinal, 0),
+        )
+    )
     return module
+
+
+class DeepseekV32IndexerCache:
+    def __init__(self, execution_ordinal: int):
+        self.dsa_kv_registration = DSAKVRegistration(execution_ordinal, 1)
+        self.get_kv_cache_spec = MagicMock(
+            return_value=MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=INDEX_HEAD_DIM,
+                dtype=torch.float32,
+                dsa_kv_registration=DSAKVRegistration(execution_ordinal, 1),
+            )
+        )
 
 
 def _attn_group(layer_name: str, spec):
@@ -64,6 +93,7 @@ class _RunnerMixin:
         runner.kv_cache_dtype = torch.float32
         runner.shared_kv_cache_layers = {}
         runner.dsa_unbundle = False
+        runner.dsa_two_groups = False
         runner.dsa_free_paged = False
         runner.dsa_shared_pool = False
         runner.use_sparse_c8_indexer = use_sparse_c8_indexer
@@ -129,6 +159,28 @@ class TestGetKVCacheSpecSharedIndexer(_RunnerMixin, unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "free-paged"):
             runner.get_kv_cache_spec()
 
+    def test_unbundled_specs_preserve_model_registrations(self, mock_get_layers, _mock_ec):
+        runner = self._build_runner()
+        runner.dsa_unbundle = True
+        runner.dsa_two_groups = True
+        latent_name = "opaque.latent.cache"
+        indexer_name = "opaque.physical.cache"
+        mock_get_layers.return_value = {
+            latent_name: _attn_layer(True, execution_ordinal=6),
+            indexer_name: DeepseekV32IndexerCache(execution_ordinal=78),
+        }
+
+        specs = runner.get_kv_cache_spec()
+
+        self.assertEqual(
+            specs[latent_name].dsa_kv_registration,
+            DSAKVRegistration(execution_ordinal=6, kv_group=0),
+        )
+        self.assertEqual(
+            specs[indexer_name].dsa_kv_registration,
+            DSAKVRegistration(execution_ordinal=78, kv_group=1),
+        )
+
 
 class TestAllocateReshapeSharedIndexer(_RunnerMixin, unittest.TestCase):
     def _allocate_and_reshape(self, *, has_indexer: bool):
@@ -186,6 +238,118 @@ class TestAllocateReshapeSharedIndexer(_RunnerMixin, unittest.TestCase):
         self.assertEqual(k_nope.shape[-1], KV_LORA_RANK)
         self.assertEqual(k_pe.shape[-1], QK_ROPE_HEAD_DIM)
         self.assertEqual(dsa_k.shape[-1], INDEX_HEAD_DIM)
+
+
+def _registered_glm52_specs() -> dict[str, KVCacheSpec]:
+    producer_executions = {0, 1, 2} | {6 + 4 * i for i in range(18)} | {78}
+    specs: dict[str, KVCacheSpec] = {
+        f"latent.execution.{execution}": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+            dtype=torch.float32,
+            dsa_kv_registration=DSAKVRegistration(execution, 0),
+        )
+        for execution in range(79)
+    }
+    specs.update(
+        {
+            f"physical.indexer.{execution}": MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=INDEX_HEAD_DIM,
+                dtype=torch.float32,
+                dsa_kv_registration=DSAKVRegistration(execution, 1),
+            )
+            for execution in producer_executions
+        }
+    )
+    return specs
+
+
+def _topology_runner_and_config():
+    specs = _registered_glm52_specs()
+    topology = build_dsa_kv_topology(specs)
+    latent_names = [row.layer_name for row in topology.rows_by_group[0]]
+    indexer_names = [row.layer_name for row in topology.rows_by_group[1]]
+    config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(latent_names, specs[latent_names[0]]),
+            KVCacheGroupSpec(indexer_names, specs[indexer_names[0]]),
+        ],
+        dsa_kv_topology=topology,
+    )
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.dsa_two_groups = True
+    runner._dsa_kv_specs_by_layer_name = specs
+    return runner, config
+
+
+class TestDSAKVTopologyInitialization(unittest.TestCase):
+    def test_validates_and_caches_glm52_topology(self):
+        runner, config = _topology_runner_and_config()
+
+        with patch.object(model_runner_module.logger, "info_once") as info_once:
+            runner._validate_and_cache_dsa_kv_topology(config)
+
+        self.assertIs(runner.dsa_kv_topology, config.dsa_kv_topology)
+        self.assertEqual(len(runner.dsa_kv_rows_by_layer_name), 79 + 22)
+        self.assertEqual(len(runner.dsa_kv_executions_by_ordinal), 79)
+        execution_6 = runner.dsa_kv_executions_by_ordinal[6]
+        self.assertEqual(execution_6.latent.row_ordinal, 6)
+        self.assertEqual(execution_6.indexer.row_ordinal, 3)
+        execution_78 = runner.dsa_kv_executions_by_ordinal[78]
+        self.assertEqual(execution_78.latent.row_ordinal, 78)
+        self.assertEqual(execution_78.indexer.row_ordinal, 21)
+        info_once.assert_called_once()
+        self.assertEqual(info_once.call_args.args[2:], (79, 79, 22))
+
+    def test_missing_topology_fails_closed(self):
+        runner, config = _topology_runner_and_config()
+        config.dsa_kv_topology = None
+
+        with self.assertRaisesRegex(ValueError, "requires.*topology"):
+            runner._validate_and_cache_dsa_kv_topology(config)
+
+    def test_partial_topology_fails_closed(self):
+        runner, config = _topology_runner_and_config()
+        topology = config.dsa_kv_topology
+        assert topology is not None
+        config.dsa_kv_topology = replace(
+            topology,
+            executions=topology.executions[:-1],
+            rows_by_group=(
+                topology.rows_by_group[0][:-1],
+                topology.rows_by_group[1][:-1],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing registered cache layers"):
+            runner._validate_and_cache_dsa_kv_topology(config)
+
+    def test_registration_mismatch_fails_closed(self):
+        runner, config = _topology_runner_and_config()
+        layer_name = "latent.execution.6"
+        runner._dsa_kv_specs_by_layer_name[layer_name] = replace(
+            runner._dsa_kv_specs_by_layer_name[layer_name],
+            dsa_kv_registration=DSAKVRegistration(7, 0),
+        )
+
+        with self.assertRaisesRegex(ValueError, "registration mismatch"):
+            runner._validate_and_cache_dsa_kv_topology(config)
+
+    def test_feature_off_ignores_missing_topology(self):
+        runner, config = _topology_runner_and_config()
+        runner.dsa_two_groups = False
+        config.dsa_kv_topology = None
+
+        runner._validate_and_cache_dsa_kv_topology(config)
+
+        self.assertIsNone(runner.dsa_kv_topology)
+        self.assertEqual(runner.dsa_kv_rows_by_layer_name, {})
+        self.assertEqual(runner.dsa_kv_executions_by_ordinal, {})
 
 
 if __name__ == "__main__":

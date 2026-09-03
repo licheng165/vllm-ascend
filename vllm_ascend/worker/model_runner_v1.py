@@ -58,6 +58,9 @@ from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    DSAExecutionRow,
+    DSAKVRow,
+    DSAKVTopology,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -498,6 +501,10 @@ class NPUModelRunner(GPUModelRunner):
         # same env var). Requires UNBUNDLE. Prerequisite for freeing latent blocks
         # at end of prefill while the indexer stays resident.
         self.dsa_two_groups = bool(self.dsa_unbundle and envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS)
+        self.dsa_kv_topology: DSAKVTopology | None = None
+        self.dsa_kv_rows_by_layer_name: dict[str, DSAKVRow] = {}
+        self.dsa_kv_executions_by_ordinal: dict[int, DSAExecutionRow] = {}
+        self._dsa_kv_specs_by_layer_name: dict[str, KVCacheSpec] = {}
         if self.dsa_two_groups:
             logger.info("DSA two-group mode enabled: separate block tables/pools for latent and indexer.")
         elif envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
@@ -4220,8 +4227,11 @@ class NPUModelRunner(GPUModelRunner):
                 "captured addresses."
             )
         self._validate_sfa_layerwise_connector_cudagraph_mode()
+        dsa_kv_topology = kv_cache_config.dsa_kv_topology
         kv_cache_config = deepcopy(kv_cache_config)
+        kv_cache_config.dsa_kv_topology = dsa_kv_topology
         self.kv_cache_config = kv_cache_config
+        self._validate_and_cache_dsa_kv_topology(kv_cache_config)
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
@@ -4301,6 +4311,151 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _validate_and_cache_dsa_kv_topology(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        self.dsa_kv_topology = None
+        self.dsa_kv_rows_by_layer_name = {}
+        self.dsa_kv_executions_by_ordinal = {}
+        if not getattr(self, "dsa_two_groups", False):
+            return
+
+        topology = kv_cache_config.dsa_kv_topology
+        if topology is None:
+            raise ValueError(
+                "DSA two-group mode requires a canonical DSA KV topology."
+            )
+        if len(kv_cache_config.kv_cache_groups) != 2:
+            raise ValueError(
+                "DSA KV topology requires exactly two configured KV cache groups, "
+                f"got {len(kv_cache_config.kv_cache_groups)}."
+            )
+        if len(topology.rows_by_group) != 2:
+            raise ValueError(
+                "DSA KV topology requires exactly two row groups, "
+                f"got {len(topology.rows_by_group)}."
+            )
+
+        rows_by_layer_name: dict[str, DSAKVRow] = {}
+        rows_by_registration: dict[tuple[int, int], DSAKVRow] = {}
+        for kv_group, rows in enumerate(topology.rows_by_group):
+            for row in rows:
+                if row.kv_group != kv_group:
+                    raise ValueError(
+                        "DSA KV topology row group mismatch for "
+                        f"{row.layer_name!r}: row group={row.kv_group}, "
+                        f"container group={kv_group}."
+                    )
+                if row.layer_name in rows_by_layer_name:
+                    raise ValueError(
+                        "DSA KV topology has duplicate layer name "
+                        f"{row.layer_name!r}."
+                    )
+                registration_key = (row.execution_ordinal, row.kv_group)
+                if registration_key in rows_by_registration:
+                    raise ValueError(
+                        "DSA KV topology has duplicate execution/group "
+                        f"registration {registration_key}."
+                    )
+                rows_by_layer_name[row.layer_name] = row
+                rows_by_registration[registration_key] = row
+
+        executions_by_ordinal = {
+            execution.execution_ordinal: execution
+            for execution in topology.executions
+        }
+        if len(executions_by_ordinal) != len(topology.executions):
+            raise ValueError("DSA KV topology has duplicate execution ordinals.")
+        expected_execution_ordinals = {
+            row.execution_ordinal for row in topology.rows_by_group[0]
+        }
+        if set(executions_by_ordinal) != expected_execution_ordinals:
+            raise ValueError(
+                "DSA KV topology has a partial execution table: "
+                f"expected={sorted(expected_execution_ordinals)}, "
+                f"got={sorted(executions_by_ordinal)}."
+            )
+        for registration_key, row in rows_by_registration.items():
+            execution = executions_by_ordinal.get(row.execution_ordinal)
+            execution_row = None
+            if execution is not None:
+                execution_row = (
+                    execution.latent if row.kv_group == 0 else execution.indexer
+                )
+            if execution_row != row:
+                raise ValueError(
+                    "DSA KV topology execution row mismatch for registration "
+                    f"{registration_key}."
+                )
+
+        configured_specs = self._get_layer_kv_cache_specs(kv_cache_config)
+        configured_groups: dict[str, int] = {}
+        for kv_group, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                if layer_name in configured_groups:
+                    raise ValueError(
+                        "DSA KV cache configuration has duplicate layer name "
+                        f"{layer_name!r}."
+                    )
+                configured_groups[layer_name] = kv_group
+
+        missing_topology_rows = sorted(
+            set(configured_groups) - set(rows_by_layer_name)
+        )
+        if missing_topology_rows:
+            raise ValueError(
+                "DSA KV topology is missing registered cache layers: "
+                f"{missing_topology_rows}."
+            )
+        registered_specs = getattr(self, "_dsa_kv_specs_by_layer_name", {})
+        missing_registered_specs = sorted(
+            set(configured_groups) - set(registered_specs)
+        )
+        if missing_registered_specs:
+            raise ValueError(
+                "DSA two-group mode is missing model-provided registrations for "
+                f"cache layers: {missing_registered_specs}."
+            )
+
+        for layer_name, kv_group in configured_groups.items():
+            row = rows_by_layer_name[layer_name]
+            if row.kv_group != kv_group:
+                raise ValueError(
+                    "DSA KV topology/config group mismatch for "
+                    f"{layer_name!r}: topology={row.kv_group}, config={kv_group}."
+                )
+            registered_spec = registered_specs[layer_name]
+            registration = registered_spec.dsa_kv_registration
+            assert registration is not None
+            if (
+                registration.execution_ordinal != row.execution_ordinal
+                or registration.kv_group != row.kv_group
+            ):
+                raise ValueError(
+                    "DSA KV topology/model registration mismatch for "
+                    f"{layer_name!r}: topology=({row.execution_ordinal}, "
+                    f"{row.kv_group}), model=({registration.execution_ordinal}, "
+                    f"{registration.kv_group})."
+                )
+            if registered_spec != configured_specs[layer_name]:
+                raise ValueError(
+                    "DSA KV topology/config spec mismatch for "
+                    f"{layer_name!r}."
+                )
+
+        self.dsa_kv_topology = topology
+        self.dsa_kv_rows_by_layer_name = rows_by_layer_name
+        self.dsa_kv_executions_by_ordinal = executions_by_ordinal
+        logger.info_once(
+            "DSA KV topology initialized: signature=%s executions=%d "
+            "latent_rows=%d indexer_rows=%d.",
+            topology.signature,
+            len(topology.executions),
+            len(topology.rows_by_group[0]),
+            len(topology.rows_by_group[1]),
+            scope="local",
+        )
 
     def _maybe_init_dsa_latent_offload(self) -> None:
         """Build the DSA latent-offload manager (GLM5.1) when enabled.
@@ -5106,6 +5261,8 @@ class NPUModelRunner(GPUModelRunner):
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, MLAAttention):
+                model_spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                dsa_kv_registration = model_spec.dsa_kv_registration
                 if self.use_sparse:
                     # `MLAAttentionSpec` is temporarily patched to `AscendMLAAttentionSpec`.
                     # Re-importing it at runtime will therefore resolve to the patched class.
@@ -5126,6 +5283,7 @@ class NPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=False,
+                            dsa_kv_registration=dsa_kv_registration,
                         )
                     elif self.dsa_free_paged:
                         # DSA offload (M-B): paged cache holds ONLY the indexer key;
@@ -5146,6 +5304,7 @@ class NPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=False,
+                            dsa_kv_registration=dsa_kv_registration,
                         )
                     elif not getattr(attn_module.impl, "has_indexer", True):
                         # Bundled shared-indexer consumer (GLM-5.2): the layer
@@ -5160,6 +5319,7 @@ class NPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=False,
+                            dsa_kv_registration=dsa_kv_registration,
                         )
                     else:
                         kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
@@ -5170,28 +5330,38 @@ class NPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=self.use_sparse_c8_indexer,
+                            dsa_kv_registration=dsa_kv_registration,
                         )
-                elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    assert isinstance(spec, MLAAttentionSpec)
+                else:
+                    assert isinstance(model_spec, MLAAttentionSpec)
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
                         dtype, cache_dtype_str = attn_module.impl.dtype, None
                     else:
-                        head_size, dtype, cache_dtype_str = spec.head_size, spec.dtype, spec.cache_dtype_str
+                        head_size = model_spec.head_size
+                        dtype = model_spec.dtype
+                        cache_dtype_str = model_spec.cache_dtype_str
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=spec.block_size,
-                        num_kv_heads=spec.num_kv_heads,
+                        block_size=model_spec.block_size,
+                        num_kv_heads=model_spec.num_kv_heads,
                         head_size=head_size,
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
+                        dsa_kv_registration=dsa_kv_registration,
                     )
 
-            elif self.dsa_unbundle and type(attn_module).__name__ == "DeepseekV32IndexerCache":
+            elif (
+                self.dsa_unbundle
+                and (registration := getattr(attn_module, "dsa_kv_registration", None))
+                is not None
+                and registration.kv_group == 1
+            ):
                 # Proper route P1: the indexer key cache becomes its own KV group
                 # (so the latent group's blocks can be freed independently later).
                 from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                 index_head_dim = self.sparse_head_dim[-1]
+                model_spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                     block_size=self.block_size,
                     num_kv_heads=1,
@@ -5200,6 +5370,7 @@ class NPUModelRunner(GPUModelRunner):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                     cache_sparse_c8=self.use_sparse_c8_indexer,
+                    dsa_kv_registration=registration,
                 )
 
             elif isinstance(attn_module, MambaBase):
@@ -5216,7 +5387,13 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
-        if self.use_sparse:
+        self._dsa_kv_specs_by_layer_name = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if spec.dsa_kv_registration is not None
+        }
+
+        if self.use_sparse and not self.dsa_two_groups:
             # Startup artifact for shared-indexer models (GLM-5.2): report the
             # registered cache topology derived from runtime construction. The
             # expected values (e.g. 79 LATENT / 22 INDEXER with MTP1) are a
