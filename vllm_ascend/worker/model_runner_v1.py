@@ -67,6 +67,7 @@ from vllm.v1.core.dsa_shared_pool import (
     MAX_ALLOCATION_GENERATION,
     DSABlockAllocationMode,
 )
+from vllm.v1.core.kv_cache_utils import get_layerwise_prefill_max_tokens
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -4604,6 +4605,7 @@ class NPUModelRunner(GPUModelRunner):
             self._validate_layerwise_prefill_runtime(
                 kv_cache_config.dsa_kv_topology
             )
+            self._log_layerwise_prefill_startup(kv_cache_config)
         if staged_sfa_graph_configured(self.vllm_config) and getattr(
             self,
             "_staged_sfa_startup_capture_attempted",
@@ -4956,6 +4958,59 @@ class NPUModelRunner(GPUModelRunner):
 
         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
         return kv_cache_spec.head_size, head_size_v
+
+    def _log_layerwise_prefill_startup(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Log one §13.1 startup line per P-node worker."""
+
+        slab_spec = self._get_layerwise_prefill_slab_spec(kv_cache_config)
+        topology = kv_cache_config.dsa_kv_topology
+        assert topology is not None
+        connector = get_kv_transfer_group()
+        logger.info(
+            "Layerwise-prefill P worker: residency_mode=PREFILL_LAYERWISE "
+            "topology_signature=%s latent_layers=%d indexer_layers=%d "
+            "producer_executions=%d latent_page_bytes=%d "
+            "indexer_page_bytes=%d bundle_page_bytes=%d "
+            "latent_blocks_per_bundle=%d indexer_blocks_per_bundle=%d "
+            "available_kv_bytes=%d parent_capacity=%d child_capacity=%d "
+            "slab_bytes=%d max_tokens=%d graph_mode=%s "
+            "connector_transfer_window=%s connector_sync_callbacks=%s "
+            "connector_indexer_persistence=%s.",
+            topology.signature,
+            len(topology.rows_by_group[0]),
+            len(topology.rows_by_group[1]),
+            sum(
+                1
+                for execution in topology.executions
+                if execution.indexer is not None
+            ),
+            slab_spec.latent_page_size_bytes,
+            slab_spec.indexer_page_size_bytes,
+            slab_spec.bundle_page_size_bytes,
+            slab_spec.bundle_page_size_bytes // slab_spec.latent_page_size_bytes,
+            slab_spec.bundle_page_size_bytes
+            // slab_spec.indexer_page_size_bytes,
+            slab_spec.slab_size_bytes,
+            kv_cache_config.num_blocks,
+            len(topology.rows_by_group[0]) * kv_cache_config.num_blocks,
+            slab_spec.slab_size_bytes,
+            get_layerwise_prefill_max_tokens(kv_cache_config),
+            self.compilation_config.cudagraph_mode.name,
+            getattr(
+                connector,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            ),
+            getattr(
+                connector,
+                "supports_layerwise_prefill_eager_callbacks",
+                False,
+            ),
+            getattr(connector, "supports_dsa_index_lmcache", False),
+        )
 
     def _get_layerwise_prefill_slab_spec(
         self,

@@ -176,6 +176,41 @@ def test_global_slab_has_one_allocation_owner_reshape_and_null() -> None:
     )
 
 
+def test_startup_log_reports_p_node_observability() -> None:
+    runner = _runner()
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+    runner.dsa_kv_topology = _topology()
+    config = _global_slab_config()
+    connector = SimpleNamespace(
+        supports_layerwise_prefill_p_node=True,
+        supports_layerwise_prefill_transfer_window=True,
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+    )
+    logged = []
+
+    def capture_info(message, *args, **_kwargs):
+        logged.append(message % args if args else message)
+
+    with (
+        patch.object(model_runner_module, "get_kv_transfer_group", return_value=connector),
+        patch.object(model_runner_module.logger, "info", capture_info),
+    ):
+        runner._log_layerwise_prefill_startup(config)
+
+    message = next(
+        message
+        for message in logged
+        if "Layerwise-prefill P worker" in message
+    )
+    assert "residency_mode=PREFILL_LAYERWISE" in message
+    assert "latent_layers=79 indexer_layers=22" in message
+    assert "producer_executions=22" in message
+    assert "parent_capacity=2 child_capacity=158" in message
+    assert "connector_transfer_window=True" in message
+    assert "connector_indexer_persistence=True" in message
+
+
 def test_global_slab_rejects_a_missing_single_null_bundle() -> None:
     runner = _runner()
     config = _global_slab_config()
