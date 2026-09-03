@@ -247,6 +247,29 @@ class NPUPlatform(Platform):
         pass
 
     @classmethod
+    def _validate_sparse_decode_d_node_prerequisites(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> None:
+        """Validate the closed D-node prerequisites before any capacity work."""
+        failures: list[str] = []
+        if not envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE:
+            failures.append("VLLM_ASCEND_DSA_UNBUNDLE=1")
+        if not envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS:
+            failures.append("VLLM_ASCEND_DSA_TWO_GROUPS=1")
+        if not envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL:
+            failures.append("VLLM_ASCEND_DSA_SHARED_POOL=1")
+        if envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT != 2:
+            failures.append("VLLM_ASCEND_DSA_SHRINK_LATENT=2")
+        if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+            failures.append("--no-enable-prefix-caching")
+        if failures:
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires: "
+                + ", ".join(failures)
+            )
+
+    @classmethod
     def set_device(cls, device: torch.device):
         torch.npu.set_device(device)
 
@@ -302,6 +325,15 @@ class NPUPlatform(Platform):
 
         if (
             envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+            and envs_ascend.VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE
+        ):
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and "
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE are mutually exclusive."
+            )
+
+        if (
+            envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             raise ValueError(
@@ -309,6 +341,9 @@ class NPUPlatform(Platform):
                 "execution (cudagraph_mode=NONE); PIECEWISE P-node address and "
                 "callback semantics are deferred to Stage 8."
             )
+
+        if envs_ascend.VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE:
+            cls._validate_sparse_decode_d_node_prerequisites(vllm_config)
 
         if ascend_config.xlite_graph_config.enabled:
             if ascend_config.xlite_graph_config.full_mode:

@@ -250,6 +250,58 @@ class TestNPUPlatform(TestBase):
         ):
             self.platform.check_and_update_config(vllm_config)
 
+    def test_d_node_mode_is_mutually_exclusive_with_p_node(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "true",
+                    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE": "true",
+                },
+            ),
+            pytest.raises(ValueError, match="mutually exclusive"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
+    def test_d_node_mode_requires_closed_prerequisites(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "false",
+                    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE": "true",
+                    "VLLM_ASCEND_DSA_UNBUNDLE": "1",
+                    "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
+                    "VLLM_ASCEND_DSA_SHARED_POOL": "1",
+                    "VLLM_ASCEND_DSA_SHRINK_LATENT": "0",
+                },
+            ),
+            pytest.raises(ValueError, match="DSA_SHRINK_LATENT=2"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "false",
+                    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE": "true",
+                    "VLLM_ASCEND_DSA_UNBUNDLE": "1",
+                    "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
+                    "VLLM_ASCEND_DSA_SHARED_POOL": "1",
+                    "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
+                },
+            ),
+            pytest.raises(ValueError, match="prefix-caching"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
     def test_get_device_capability(self):
         self.assertIsNone(self.platform.get_device_capability(device_id=0))
 

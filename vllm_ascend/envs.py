@@ -41,6 +41,19 @@ def _layerwise_prefill_p_node_enabled() -> bool:
     )
 
 
+def _sparse_decode_d_node_enabled() -> bool:
+    raw = os.getenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE must be 'true' or 'false', "
+        f"got {raw!r}"
+    )
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -159,6 +172,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Keep the true/false spelling aligned with the vLLM allocator gate.
     # Default false. Non-sensitive and fixed for the worker lifetime.
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": _layerwise_prefill_p_node_enabled,
+    # Run the DSA decoder in sparse-managed mode: full INDEXER resident, only
+    # compact-scratch LATENT on NPU, historical LATENT retrieved per layer
+    # from LMCache. Mutually exclusive with
+    # VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE. Requires DSA_UNBUNDLE=1,
+    # DSA_TWO_GROUPS=1, DSA_SHARED_POOL=1, DSA_SHRINK_LATENT=2 and
+    # --no-enable-prefix-caching. Default false; non-sensitive and fixed for
+    # the worker lifetime.
+    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE": _sparse_decode_d_node_enabled,
     # Debug/compat switch: disable DSA indexer LMCache/index-offload hooks.
     # When enabled, unbundled indexer 1-tuple caches stay resident and are not
     # registered with LMCache connectors that cannot permute 1-tuple KV entries.
