@@ -67,10 +67,14 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    finish_layerwise_prefill_save_to_connector,
     get_lmcache_sparse_cached_tokens,
+    layerwise_prefill_transfer_window_active,
     maybe_save_kv_layer_to_connector,
     save_layerwise_prefill_to_connector,
     staged_sfa_connector_supports_sparse_load,
+    submit_layerwise_prefill_load_to_connector,
+    submit_layerwise_prefill_save_to_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -3058,6 +3062,32 @@ class AscendSFAImpl(MLAAttentionImpl):
         wait_for_layerwise_prefill_from_connector(callbacks)
         return callbacks
 
+    def _layerwise_prefill_row_kv_layer(
+        self,
+        callback: LayerwisePrefillCallbackMetadata,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> list[torch.Tensor]:
+        row = callback.row
+        if row.kv_group == 0:
+            if row != callback.execution.latent or len(kv_cache) < 2:
+                raise RuntimeError(
+                    "Layerwise-prefill LATENT callback has no matching KV "
+                    "planes."
+                )
+            return [kv_cache[0], kv_cache[1]]
+        if row.kv_group == 1:
+            if (
+                row != callback.execution.indexer
+                or not self.has_indexer
+                or len(kv_cache) < 3
+            ):
+                raise RuntimeError(
+                    "Layerwise-prefill INDEXER callback has no matching "
+                    "producer KV plane."
+                )
+            return [kv_cache[2]]
+        raise RuntimeError(f"Unsupported layerwise-prefill KV group {row.kv_group}.")
+
     def _save_layerwise_prefill_rows(
         self,
         callbacks: tuple[LayerwisePrefillCallbackMetadata, ...],
@@ -3065,34 +3095,35 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: AscendSFAMetadata,
     ) -> None:
         for callback in callbacks:
-            row = callback.row
-            if row.kv_group == 0:
-                if row != callback.execution.latent or len(kv_cache) < 2:
-                    raise RuntimeError(
-                        "Layerwise-prefill LATENT callback has no matching KV "
-                        "planes."
-                    )
-                kv_layer = [kv_cache[0], kv_cache[1]]
-            elif row.kv_group == 1:
-                if (
-                    row != callback.execution.indexer
-                    or not self.has_indexer
-                    or len(kv_cache) < 3
-                ):
-                    raise RuntimeError(
-                        "Layerwise-prefill INDEXER callback has no matching "
-                        "producer KV plane."
-                    )
-                kv_layer = [kv_cache[2]]
-            else:
-                raise RuntimeError(
-                    f"Unsupported layerwise-prefill KV group {row.kv_group}."
-                )
             save_layerwise_prefill_to_connector(
                 callback,
-                kv_layer,
+                self._layerwise_prefill_row_kv_layer(callback, kv_cache),
                 attn_metadata,
             )
+
+    def _submit_layerwise_prefill_saves(
+        self,
+        callbacks: tuple[LayerwisePrefillCallbackMetadata, ...],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendSFAMetadata,
+    ) -> None:
+        """Pre-HCOM phase: enqueue device-side D2H for every present row."""
+
+        for callback in callbacks:
+            submit_layerwise_prefill_save_to_connector(
+                callback,
+                self._layerwise_prefill_row_kv_layer(callback, kv_cache),
+                attn_metadata,
+            )
+
+    def _finish_layerwise_prefill_saves(
+        self,
+        callbacks: tuple[LayerwisePrefillCallbackMetadata, ...],
+    ) -> None:
+        """Post-HCOM phase: publish every row submitted before the window."""
+
+        for callback in callbacks:
+            finish_layerwise_prefill_save_to_connector(callback)
 
     def _record_reshape_cache_event(
         self,
@@ -4252,6 +4283,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             layer_name,
             attn_metadata,
         )
+        layerwise_prefill_transfer_window = bool(layerwise_prefill_callbacks) and (
+            layerwise_prefill_transfer_window_active()
+        )
         _is_pure_decode = attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
@@ -5313,11 +5347,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             _dsa_prof.step()
 
         if layerwise_prefill_callbacks:
-            self._save_layerwise_prefill_rows(
-                layerwise_prefill_callbacks,
-                kv_cache,
-                attn_metadata,
-            )
+            if layerwise_prefill_transfer_window:
+                # Pre-HCOM phase: only enqueue device-side D2H so the
+                # projection/all-reduce window is not stalled by host work.
+                self._submit_layerwise_prefill_saves(
+                    layerwise_prefill_callbacks,
+                    kv_cache,
+                    attn_metadata,
+                )
+                submit_layerwise_prefill_load_to_connector(
+                    layerwise_prefill_callbacks[0]
+                )
+            else:
+                self._save_layerwise_prefill_rows(
+                    layerwise_prefill_callbacks,
+                    kv_cache,
+                    attn_metadata,
+                )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -5356,6 +5402,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(attn_output)[0]
 
         if layerwise_prefill_callbacks:
+            if layerwise_prefill_transfer_window:
+                # Post-HCOM phase: the all-reduce is submitted, so host-side
+                # publication of the rows enqueued before the window is safe.
+                # A failure between submit and here leaves the saves
+                # unpublished (fenced by the connector), never falsely
+                # marked complete.
+                self._finish_layerwise_prefill_saves(layerwise_prefill_callbacks)
             _dsa_prof.end(_sfa_t)
             return output_padded
 

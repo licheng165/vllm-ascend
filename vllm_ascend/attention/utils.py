@@ -755,6 +755,72 @@ def save_layerwise_prefill_to_connector(
     save(callback, kv_layer, attn_metadata)
 
 
+def layerwise_prefill_transfer_window_active() -> bool:
+    """Whether the active connector implements the Stage 4 transfer window."""
+
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    connector = get_kv_transfer_group()
+    return (
+        getattr(connector, "supports_layerwise_prefill_transfer_window", False)
+        is True
+    )
+
+
+def _get_layerwise_prefill_transfer_window_connector(hook_name: str):
+    connector = _get_layerwise_prefill_p_node_connector()
+    if (
+        getattr(connector, "supports_layerwise_prefill_transfer_window", False)
+        is not True
+    ):
+        raise RuntimeError(
+            "The active KV connector does not support the layerwise-prefill "
+            "transfer window."
+        )
+    hook = getattr(connector, hook_name, None)
+    if not callable(hook):
+        raise RuntimeError(
+            "Layerwise-prefill transfer-window connector has no "
+            f"{hook_name} callback."
+        )
+    return hook
+
+
+def submit_layerwise_prefill_save_to_connector(
+    callback: LayerwisePrefillCallbackMetadata,
+    kv_layer: Any,
+    attn_metadata: Any,
+) -> None:
+    """Enqueue one canonical row D2H save inside the transfer window."""
+
+    submit = _get_layerwise_prefill_transfer_window_connector(
+        "submit_layerwise_prefill_save"
+    )
+    submit(callback, kv_layer, attn_metadata)
+
+
+def submit_layerwise_prefill_load_to_connector(
+    callback: LayerwisePrefillCallbackMetadata,
+) -> None:
+    """Enqueue the next row loads for the callback's groups (pre-HCOM)."""
+
+    submit = _get_layerwise_prefill_transfer_window_connector(
+        "submit_layerwise_prefill_load"
+    )
+    submit(callback)
+
+
+def finish_layerwise_prefill_save_to_connector(
+    callback: LayerwisePrefillCallbackMetadata,
+) -> None:
+    """Publish one submitted row save after the HCOM window closed."""
+
+    finish = _get_layerwise_prefill_transfer_window_connector(
+        "finish_layerwise_prefill_save"
+    )
+    finish(callback)
+
+
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0

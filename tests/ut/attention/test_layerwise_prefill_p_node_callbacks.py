@@ -5,6 +5,7 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     LayerwisePrefillCallbackMetadata,
@@ -43,9 +44,12 @@ def test_eager_forward_wires_callbacks_around_all_kv_and_sfa_work() -> None:
         "_wait_for_layerwise_prefill_rows",
         "self.exec_kv(",
         "self._execute_sparse_flash_attention_process(",
-        "self._save_layerwise_prefill_rows(",
+        "_submit_layerwise_prefill_saves(",
+        "submit_layerwise_prefill_load_to_connector(",
+        "_save_layerwise_prefill_rows(",
         "self._v_up_proj(",
         "self.o_proj(attn_output)",
+        "_finish_layerwise_prefill_saves(",
     )
     offsets = [source.index(operation) for operation in ordered_operations]
     assert offsets == sorted(offsets)
@@ -127,6 +131,111 @@ def test_shared_consumer_records_the_producer_cache_event() -> None:
     impl._record_reshape_cache_event((torch.empty(1), torch.empty(1)), metadata)
 
     event.record.assert_called_once_with()
+
+
+def _transfer_window_connector() -> MagicMock:
+    connector = MagicMock()
+    connector.supports_layerwise_prefill_p_node = True
+    connector.supports_layerwise_prefill_transfer_window = True
+    return connector
+
+
+def test_transfer_window_splits_submit_and_finish_around_hcom() -> None:
+    callbacks = _producer_callbacks()
+    metadata = SimpleNamespace(layerwise_prefill_callback_metadata=callbacks)
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.has_indexer = True
+    kv_cache = tuple(torch.empty(1) for _ in range(3))
+    connector = _transfer_window_connector()
+    events: list[str] = []
+    connector.submit_layerwise_prefill_save.side_effect = (
+        lambda callback, _kv_layer, _metadata: events.append(
+            f"submit-save-{callback.row.kv_group}"
+        )
+    )
+    connector.submit_layerwise_prefill_load.side_effect = lambda _callback: events.append(
+        "submit-load"
+    )
+    connector.finish_layerwise_prefill_save.side_effect = lambda callback: events.append(
+        f"finish-{callback.row.kv_group}"
+    )
+
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        assert attention_utils.layerwise_prefill_transfer_window_active() is True
+        impl._submit_layerwise_prefill_saves(callbacks, kv_cache, metadata)
+        attention_utils.submit_layerwise_prefill_load_to_connector(callbacks[0])
+        events.extend(("v-up", "o-proj", "hcom"))
+        impl._finish_layerwise_prefill_saves(callbacks)
+
+    assert events == [
+        "submit-save-0",
+        "submit-save-1",
+        "submit-load",
+        "v-up",
+        "o-proj",
+        "hcom",
+        "finish-0",
+        "finish-1",
+    ]
+    latent_submit, indexer_submit = (
+        connector.submit_layerwise_prefill_save.call_args_list
+    )
+    assert latent_submit.args[1][0] is kv_cache[0]
+    assert latent_submit.args[1][1] is kv_cache[1]
+    assert indexer_submit.args[1] == [kv_cache[2]]
+    connector.save_layerwise_prefill_kv_layer.assert_not_called()
+    connector.submit_layerwise_prefill_load.assert_called_once_with(callbacks[0])
+
+
+def test_transfer_window_shared_consumer_only_submits_latent() -> None:
+    callbacks = _consumer_callbacks()
+    metadata = SimpleNamespace(layerwise_prefill_callback_metadata=callbacks)
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.has_indexer = False
+    kv_cache = (torch.empty(1), torch.empty(1))
+    connector = _transfer_window_connector()
+
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        impl._submit_layerwise_prefill_saves(callbacks, kv_cache, metadata)
+        attention_utils.submit_layerwise_prefill_load_to_connector(callbacks[0])
+        impl._finish_layerwise_prefill_saves(callbacks)
+
+    connector.submit_layerwise_prefill_save.assert_called_once()
+    submit_args = connector.submit_layerwise_prefill_save.call_args.args
+    assert submit_args[0] is callbacks[0]
+    assert submit_args[1][0] is kv_cache[0]
+    assert submit_args[1][1] is kv_cache[1]
+    connector.finish_layerwise_prefill_save.assert_called_once_with(callbacks[0])
+
+
+def test_sync_connectors_do_not_activate_the_transfer_window() -> None:
+    connector = MagicMock()
+    connector.supports_layerwise_prefill_p_node = True
+    connector.supports_layerwise_prefill_transfer_window = False
+    callbacks = _producer_callbacks()
+
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        assert attention_utils.layerwise_prefill_transfer_window_active() is False
+        with pytest.raises(RuntimeError, match="transfer window"):
+            attention_utils.submit_layerwise_prefill_load_to_connector(callbacks[0])
+        with pytest.raises(RuntimeError, match="transfer window"):
+            attention_utils.finish_layerwise_prefill_save_to_connector(callbacks[0])
+        with pytest.raises(RuntimeError, match="transfer window"):
+            attention_utils.submit_layerwise_prefill_save_to_connector(
+                callbacks[0], [], object()
+            )
 
 
 def test_unpadding_preserves_indexer_mapping_and_callbacks() -> None:
