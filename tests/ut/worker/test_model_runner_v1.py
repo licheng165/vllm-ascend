@@ -123,6 +123,48 @@ class TestFixedDecodeLayoutArrays(unittest.TestCase):
             )
 
 
+class TestMTPPlaceholderForwardInputs(unittest.TestCase):
+    @staticmethod
+    def _build_runner():
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
+            gpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
+        )
+        return runner
+
+    def test_placeholder_tokens_are_sanitized_only_for_forward(self):
+        runner = self._build_runner()
+        scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={"req0": [-1]},
+        )
+
+        runner._sanitize_placeholder_input_ids_for_forward(
+            scheduler_output,
+            num_forward_tokens=4,
+        )
+
+        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 33, 0])
+        self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, 33, -1])
+        self.assertEqual(
+            scheduler_output.scheduled_spec_decode_tokens,
+            {"req0": [-1]},
+        )
+
+    def test_forward_input_is_unchanged_without_placeholder_metadata(self):
+        runner = self._build_runner()
+        scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={"req0": [7]},
+        )
+
+        runner._sanitize_placeholder_input_ids_for_forward(
+            scheduler_output,
+            num_forward_tokens=4,
+        )
+
+        self.assertEqual(runner.input_ids.gpu.tolist(), [11, -1, 33, -1])
+
+
 class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
     def test_short_synthetic_sequences_use_no_remap_sentinel(self):
         for query_width, seq_lens, expected in (

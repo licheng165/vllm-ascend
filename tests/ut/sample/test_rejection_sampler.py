@@ -18,8 +18,13 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.sample.rejection_sampler import (
-    expand_batch_to_tokens, expand_pytorch, rejection_greedy_sample_pytorch,
-    rejection_random_sample_pytorch, sample_recovered_tokens_pytorch)
+    expand_batch_to_tokens,
+    expand_pytorch,
+    rejection_greedy_sample_pytorch,
+    rejection_random_sample_block_verify_pytorch,
+    rejection_random_sample_pytorch,
+    sample_recovered_tokens_pytorch,
+)
 
 # Global constants
 PLACEHOLDER_TOKEN_ID = -1
@@ -126,6 +131,68 @@ class TestAscendRejectionSampler(TestBase):
     @patch('torch.ones', new=mock_pin_memory(torch.ones))
     @patch('torch.full', new=mock_pin_memory(torch.full))
     @patch('torch.tensor', new=mock_pin_memory(torch.tensor))
+    def test_rejection_random_sample_pytorch_rejects_placeholder(self):
+        output_token_ids = torch.full((1, 2), PLACEHOLDER_TOKEN_ID)
+        cu_num_draft_tokens = torch.tensor([1])
+        draft_token_ids = torch.tensor([PLACEHOLDER_TOKEN_ID])
+        target_probs = torch.tensor([[0.0, 0.0, 1.0]])
+        bonus_token_ids = torch.tensor([[100]])
+        recovered_token_ids = torch.tensor([2])
+        uniform_probs = torch.tensor([0.0])
+        is_greedy = torch.tensor([False])
+
+        rejection_random_sample_pytorch(
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            None,
+            target_probs,
+            bonus_token_ids,
+            recovered_token_ids,
+            uniform_probs,
+            is_greedy,
+            max_spec_len=1,
+            vocab_size=3,
+            IS_NGRAM=True,
+        )
+
+        assert output_token_ids.tolist() == [[2, PLACEHOLDER_TOKEN_ID]]
+
+    @patch('torch.arange', new=mock_pin_memory(torch.arange))
+    @patch('torch.ones', new=mock_pin_memory(torch.ones))
+    @patch('torch.full', new=mock_pin_memory(torch.full))
+    @patch('torch.tensor', new=mock_pin_memory(torch.tensor))
+    def test_rejection_random_sample_block_verify_rejects_placeholder(self):
+        output_token_ids = torch.full((1, 2), PLACEHOLDER_TOKEN_ID)
+        cu_num_draft_tokens = torch.tensor([1])
+        draft_token_ids = torch.tensor([PLACEHOLDER_TOKEN_ID])
+        target_probs = torch.tensor([[0.0, 0.0, 1.0]])
+        bonus_token_ids = torch.tensor([[100]])
+        recovered_token_ids = torch.tensor([2])
+        uniform_probs = torch.tensor([0.0])
+        is_greedy = torch.tensor([False])
+
+        rejection_random_sample_block_verify_pytorch(
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            None,
+            target_probs,
+            bonus_token_ids,
+            recovered_token_ids,
+            uniform_probs,
+            is_greedy,
+            max_spec_len=1,
+            vocab_size=3,
+            IS_NGRAM=True,
+        )
+
+        assert output_token_ids.tolist() == [[2, PLACEHOLDER_TOKEN_ID]]
+
+    @patch('torch.arange', new=mock_pin_memory(torch.arange))
+    @patch('torch.ones', new=mock_pin_memory(torch.ones))
+    @patch('torch.full', new=mock_pin_memory(torch.full))
+    @patch('torch.tensor', new=mock_pin_memory(torch.tensor))
     def test_expand_pytorch(self):
         """Test expand_pytorch functionality"""
         input_ptr = torch.tensor([10, 20, 30], dtype=torch.int32)
@@ -154,24 +221,30 @@ class TestAscendRejectionSampler(TestBase):
         cu_num_tokens = torch.tensor([2, 5, 7])
         num_tokens = 7
         # Test PyTorch path
-        with patch("vllm_ascend.sample.rejection_sampler.HAS_TRITON", False):
-            with patch("vllm_ascend.sample.rejection_sampler.expand_pytorch"
-                       ) as mock_pytorch:
-                expand_batch_to_tokens(x, cu_num_tokens, num_tokens)
-                mock_pytorch.assert_called_once()
-                args = mock_pytorch.call_args[0]
-                assert (args[1] == x).all()
-                assert (args[2] == cu_num_tokens).all()
+        with (
+            patch("vllm_ascend.sample.rejection_sampler.HAS_TRITON", False),
+            patch(
+                "vllm_ascend.sample.rejection_sampler.expand_pytorch"
+            ) as mock_pytorch,
+        ):
+            expand_batch_to_tokens(x, cu_num_tokens, num_tokens)
+            mock_pytorch.assert_called_once()
+            args = mock_pytorch.call_args[0]
+            assert (args[1] == x).all()
+            assert (args[2] == cu_num_tokens).all()
 
         # Test Triton kernel path
-        with patch("vllm_ascend.sample.rejection_sampler.HAS_TRITON", True):
-            with patch("vllm_ascend.sample.rejection_sampler.expand_triton"
-                       ) as mock_triton:
-                expand_batch_to_tokens(x, cu_num_tokens, num_tokens)
-                mock_triton.assert_called_once()
-                call_args = mock_triton.call_args[0]
-                assert (call_args[2] == x).all()
-                assert (call_args[3] == cu_num_tokens).all()
+        with (
+            patch("vllm_ascend.sample.rejection_sampler.HAS_TRITON", True),
+            patch(
+                "vllm_ascend.sample.rejection_sampler.expand_triton"
+            ) as mock_triton,
+        ):
+            expand_batch_to_tokens(x, cu_num_tokens, num_tokens)
+            mock_triton.assert_called_once()
+            call_args = mock_triton.call_args[0]
+            assert (call_args[2] == x).all()
+            assert (call_args[3] == cu_num_tokens).all()
 
         # Run actual function
         with patch("vllm_ascend.sample.rejection_sampler.HAS_TRITON", False):
@@ -212,6 +285,31 @@ class TestAscendRejectionSampler(TestBase):
 
         assert output_token_ids[0].item() == 0
         assert output_token_ids[1].item() == 1
+
+    @patch('torch.arange', new=mock_pin_memory(torch.arange))
+    @patch('torch.ones', new=mock_pin_memory(torch.ones))
+    @patch('torch.full', new=mock_pin_memory(torch.full))
+    @patch('torch.tensor', new=mock_pin_memory(torch.tensor))
+    def test_sample_recovered_tokens_pytorch_keeps_placeholder_distribution(
+            self):
+        output_token_ids = torch.empty(1, dtype=torch.int32)
+        cu_num_draft_tokens = torch.tensor([1])
+        draft_token_ids = torch.tensor([PLACEHOLDER_TOKEN_ID])
+        target_probs = torch.tensor([[0.1, 0.2, 0.7]])
+        q = torch.ones((1, 3), dtype=torch.float32)
+
+        sample_recovered_tokens_pytorch(
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            None,
+            target_probs,
+            q,
+            vocab_size=3,
+            IS_NGRAM=True,
+        )
+
+        assert output_token_ids.tolist() == [2]
 
     @patch('torch.arange', new=mock_pin_memory(torch.arange))
     @patch('torch.ones', new=mock_pin_memory(torch.ones))

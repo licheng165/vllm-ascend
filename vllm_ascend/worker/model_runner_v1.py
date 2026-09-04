@@ -95,7 +95,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
@@ -1747,6 +1747,23 @@ class NPUModelRunner(GPUModelRunner):
 
         return attn_state
 
+    def _sanitize_placeholder_input_ids_for_forward(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_forward_tokens: int,
+    ) -> None:
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not scheduled_spec_tokens:
+            return
+        if not any(
+            PLACEHOLDER_TOKEN_ID in token_ids
+            for token_ids in scheduled_spec_tokens.values()
+        ):
+            return
+
+        input_ids = self.input_ids.gpu[:num_forward_tokens]
+        input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -2213,6 +2230,16 @@ class NPUModelRunner(GPUModelRunner):
                         == StagedSFARouteAction.STAGED
                         else None
                     ),
+                )
+
+                self._sanitize_placeholder_input_ids_for_forward(
+                    scheduler_output,
+                    num_tokens_padded
+                    if not (
+                        self.use_cp
+                        and self.pcp_manager.pcp_use_hybrid_attn
+                    )
+                    else total_num_scheduled_tokens,
                 )
 
             (
