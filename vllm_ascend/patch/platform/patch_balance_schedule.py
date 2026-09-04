@@ -163,11 +163,15 @@ class BalanceScheduler(Scheduler):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                allocation_generation = self._get_or_create_allocation_generation(
+                    request.request_id
+                )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        allocation_generation=allocation_generation,
                     )
 
                     if new_blocks is not None:
@@ -433,6 +437,9 @@ class BalanceScheduler(Scheduler):
                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
                     num_encoder_tokens = sum(request.get_num_encoder_embeds(i) for i in encoder_inputs_to_schedule)
 
+                allocation_generation = self._get_or_create_allocation_generation(
+                    request.request_id
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -442,6 +449,7 @@ class BalanceScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    allocation_generation=allocation_generation,
                 )
 
                 if new_blocks is None:
@@ -546,12 +554,33 @@ class BalanceScheduler(Scheduler):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                    allocation_generation=self._allocation_generation_for_output(
+                        req.request_id, req_to_new_blocks[req.request_id]
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                    allocation_generation=self._allocation_generation_for_output(
+                        req.request_id, req_to_new_blocks[req.request_id]
+                    ),
+                )
                 for req in scheduled_new_reqs
             ]
 
