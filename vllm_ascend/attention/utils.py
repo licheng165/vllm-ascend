@@ -265,6 +265,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
                 self.layerwise_prefill_callback_metadata
             ),
             max_seq_len=self.max_seq_len,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
                 :num_actual_reqs

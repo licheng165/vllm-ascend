@@ -3,12 +3,13 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
-                                                AscendAttentionBackendImpl,
-                                                AscendAttentionMetadataBuilder,
-                                                AscendAttentionState)
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionBackendImpl,
+    AscendAttentionMetadataBuilder,
+    AscendAttentionState,
+)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.utils import AscendDeviceType
 
 
 class TestAscendAttentionBackend(TestBase):
@@ -110,6 +111,55 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         mock_model = MagicMock()
 
         self.builder.build(1, common_attn_metadata, mock_model)
+
+    def test_unpadded_preserves_sparse_decode_metadata(self):
+        prompt_lens = torch.tensor([128, 256])
+        resident_indices = torch.tensor([3, 4])
+        resident_generations = torch.tensor([7, 8])
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]),
+            query_start_loc_cpu=torch.tensor([0, 2, 4]),
+            seq_lens=torch.tensor([130, 258]),
+            seq_lens_cpu=torch.tensor([130, 258]),
+            num_computed_tokens_cpu=torch.tensor([128, 256]),
+            num_reqs=2,
+            num_actual_tokens=4,
+            max_query_len=2,
+            block_table_tensor=torch.tensor([[1, 2], [3, 4]]),
+            slot_mapping=torch.tensor([16, 17, 48, 49]),
+            indexer_block_table_tensor=torch.tensor([[11, 12], [21, 22]]),
+            indexer_slot_mapping=torch.tensor([176, 177, 336, 337]),
+            prompt_lens_cpu=prompt_lens,
+            request_ids=["req0", "req1"],
+            cold_compact_resumes=(True, False),
+            resident_state_indices=resident_indices,
+            resident_state_generations=resident_generations,
+            resident_state_indices_cpu=resident_indices,
+            resident_state_generations_cpu=resident_generations,
+            actual_seq_lengths_q=torch.tensor([1, 2, 3, 4]),
+            positions=torch.tensor([128, 129, 256, 257]),
+            attn_state=AscendAttentionState.SpecDecoding,
+            num_input_tokens=4,
+            max_seq_len=258,
+        )
+
+        unpadded = common_attn_metadata.unpadded(
+            num_actual_tokens=2,
+            num_actual_reqs=1,
+        )
+
+        self.assertEqual(unpadded.request_ids, ["req0"])
+        self.assertEqual(unpadded.cold_compact_resumes, (True,))
+        self.assertTrue(torch.equal(unpadded.prompt_lens_cpu, prompt_lens[:1]))
+        self.assertTrue(
+            torch.equal(unpadded.resident_state_indices, resident_indices[:1])
+        )
+        self.assertTrue(
+            torch.equal(
+                unpadded.resident_state_generations,
+                resident_generations[:1],
+            )
+        )
 
 
 class TestAscendAttentionBackendImpl(TestBase):

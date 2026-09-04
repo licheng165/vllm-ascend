@@ -11,6 +11,8 @@ from vllm.config import CacheConfig, CompilationMode, CUDAGraphMode, VllmConfig,
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.eagle_proposer import (
     AscendEagleProposer,
     SpecDecodeBaseProposer,
@@ -168,6 +170,80 @@ class TestEagleProposerInitialization(TestBase):
                 torch.arange(5, dtype=torch.int32),
             )
         )
+
+    def test_mtp_input_transforms_preserve_sparse_decode_metadata(self):
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.runner = SimpleNamespace(
+            actual_seq_lengths_q=torch.tensor([2]),
+            attn_state=AscendAttentionState.SpecDecoding,
+            decode_token_per_req=torch.tensor([2]),
+        )
+        proposer.token_arange_np = np.arange(2)
+        proposer.arange = torch.arange(2)
+        proposer.pcp_size = 1
+
+        def make_metadata():
+            return AscendCommonAttentionMetadata(
+                query_start_loc=torch.tensor([0, 2]),
+                query_start_loc_cpu=torch.tensor([0, 2]),
+                seq_lens=torch.tensor([120_002]),
+                seq_lens_cpu=torch.tensor([120_002]),
+                num_computed_tokens_cpu=torch.tensor([120_000]),
+                num_reqs=1,
+                num_actual_tokens=2,
+                num_input_tokens=2,
+                max_query_len=2,
+                block_table_tensor=torch.tensor([[1, 2]]),
+                slot_mapping=torch.tensor([128, 129]),
+                indexer_block_table_tensor=torch.tensor([[11, 12]]),
+                indexer_slot_mapping=torch.tensor([1408, 1409]),
+                prompt_lens_cpu=np.array([120_000], dtype=np.int32),
+                request_ids=["req"],
+                cold_compact_resumes=(True,),
+                resident_state_indices=torch.tensor([3]),
+                resident_state_generations=torch.tensor([7]),
+                resident_state_indices_cpu=np.array([3], dtype=np.int32),
+                resident_state_generations_cpu=np.array([7], dtype=np.int64),
+                actual_seq_lengths_q=torch.tensor([2]),
+                positions=torch.tensor([120_000, 120_001]),
+                attn_state=AscendAttentionState.SpecDecoding,
+                decode_token_per_req=torch.tensor([2]),
+                max_seq_len=120_002,
+            )
+
+        source = make_metadata()
+        compact, _ = proposer.prepare_inputs(source, [[1, 2]], [1])
+
+        padded_source = make_metadata()
+        with patch(
+            "vllm_ascend.spec_decode.eagle_proposer.HAS_TRITON",
+            False,
+        ):
+            padded, *_ = proposer.prepare_inputs_padded(
+                padded_source,
+                SimpleNamespace(cu_num_draft_tokens=torch.tensor([1])),
+                torch.tensor([2]),
+            )
+
+        for transformed, original in (
+            (compact, source),
+            (padded, padded_source),
+        ):
+            self.assertIs(transformed.prompt_lens_cpu, original.prompt_lens_cpu)
+            self.assertIs(transformed.request_ids, original.request_ids)
+            self.assertIs(
+                transformed.cold_compact_resumes,
+                original.cold_compact_resumes,
+            )
+            self.assertIs(
+                transformed.resident_state_indices,
+                original.resident_state_indices,
+            )
+            self.assertIs(
+                transformed.resident_state_generations,
+                original.resident_state_generations,
+            )
+
     def test_initialization_eagle3_enforce_eager(self):
         self.vllm_config.speculative_config.method = "eagle3"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
