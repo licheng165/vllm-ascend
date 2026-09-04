@@ -9,7 +9,10 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request
 
-from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+from vllm_ascend.core.recompute_scheduler import (
+    RecomputeScheduler,
+    _should_trace_mtp_acceptance,
+)
 
 
 class _Blocks:
@@ -148,3 +151,16 @@ def test_recompute_scheduler_preserves_dsa_allocation_metadata(
     assert second.scheduled_cached_reqs.new_block_ids_by_bank == [
         expected_bank_ids
     ]
+
+
+def test_mtp_acceptance_trace_is_bounded_to_useful_frontiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_DSA_KV_POLICY_THRESHOLD", "10000")
+    request = SimpleNamespace(num_prompt_tokens=8385)
+
+    assert _should_trace_mtp_acceptance(request, 8386)
+    assert _should_trace_mtp_acceptance(request, 9998)
+    assert _should_trace_mtp_acceptance(request, 10002)
+    assert _should_trace_mtp_acceptance(request, 10240)
+    assert not _should_trace_mtp_acceptance(request, 9000)

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -45,6 +46,28 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+
+from vllm_ascend import envs as envs_ascend
+
+_MTP_ACCEPTANCE_TRACE_INTERVAL = 256
+
+
+def _should_trace_mtp_acceptance(request: Request, frontier: int) -> bool:
+    """Bound MTP diagnostics to startup and cache-policy boundaries."""
+    if frontier - request.num_prompt_tokens <= 3:
+        return True
+
+    interval_offset = frontier % _MTP_ACCEPTANCE_TRACE_INTERVAL
+    if min(interval_offset, _MTP_ACCEPTANCE_TRACE_INTERVAL - interval_offset) <= 2:
+        return True
+
+    try:
+        policy_threshold = int(
+            os.getenv("LMCACHE_DSA_KV_POLICY_THRESHOLD", "0") or 0
+        )
+    except ValueError:
+        policy_threshold = 0
+    return policy_threshold > 0 and abs(frontier - policy_threshold) <= 2
 
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
@@ -925,6 +948,27 @@ class RecomputeScheduler(Scheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                accepted_frontier = len(request.all_token_ids) + len(
+                    generated_token_ids
+                )
+                if (
+                    envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
+                    and _should_trace_mtp_acceptance(request, accepted_frontier)
+                ):
+                    invalid_count = (
+                        scheduler_output.num_invalid_spec_tokens or {}
+                    ).get(req_id, 0)
+                    logger.info(
+                        "[MTP_ACCEPT] req=%s frontier=%d draft_ids=%s "
+                        "generated_ids=%s accepted=%d invalid=%d placeholder=%s",
+                        req_id,
+                        accepted_frontier,
+                        list(scheduled_spec_token_ids),
+                        list(generated_token_ids),
+                        num_accepted,
+                        invalid_count,
+                        PLACEHOLDER_TOKEN_ID in scheduled_spec_token_ids,
+                    )
 
             stopped = False
             new_logprobs = None
