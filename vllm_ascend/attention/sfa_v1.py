@@ -4809,11 +4809,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         else 0
                     )
                     prompt_len = int(_diag_prompt_lens[row]) if row < len(_diag_prompt_lens) else current_position
-                    distance = min(
-                        current_position % _decode_window_size,
-                        (-current_position) % _decode_window_size,
-                    )
-                    sample_row = current_position - prompt_len < 3 or distance <= 4
+                    sample_row = current_position - prompt_len < 3
+                    # Save-disabled mode has no decode-window boundaries to sample.
+                    if _decode_window_size > 0:
+                        distance = min(
+                            current_position % _decode_window_size,
+                            (-current_position) % _decode_window_size,
+                        )
+                        sample_row = sample_row or distance <= 4
                     _post_commit_req_ids = getattr(
                         _diag_context,
                         "mtp_dw_diag_post_commit_req_ids",

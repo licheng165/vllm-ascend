@@ -2616,6 +2616,116 @@ class TestStagedSFAGraphPoc(TestBase):
         sparse_indices = impl._execute_sparse_flash_attention_process.call_args.args[3]
         self.assertEqual(sparse_indices.shape, (local_rows, 1, 4))
 
+    def test_forward_remap_diagnostic_sampling(self):
+        impl = self._make_eligible_impl()
+        impl.has_indexer = False
+        impl.skip_topk = True
+        impl.topk_indices_buffer = torch.tensor([[1, 7, 25, 26]], dtype=torch.int32)
+        impl.dsa_offload_unbundle = False
+        impl.is_kv_producer = False
+        impl.enable_dsa_cp_strict_accuracy = False
+        # Stub device computation, but execute forward's remap and diagnostics.
+        impl.enable_mlapo = True
+        hidden_states = torch.zeros(1, 4)
+        ql_nope, q_pe, *_ = self._make_pre_outputs()
+        impl._sfa_preprocess_with_mlapo = MagicMock(
+            return_value=(hidden_states, ql_nope, q_pe, hidden_states)
+        )
+        remapped = torch.tensor([[[0, 1, 25, 26]]], dtype=torch.int32)
+        selected = torch.tensor([[1, 7, -1, -1]], dtype=torch.int32)
+        counts = torch.tensor([2], dtype=torch.int32)
+        targets = torch.tensor([[0, 1, -1, -1]], dtype=torch.long)
+        impl._prepare_decode_sparse_indices = MagicMock(return_value=(remapped, selected, counts, targets))
+        impl._execute_sparse_flash_attention_process = MagicMock(return_value=hidden_states)
+        impl._v_up_proj = MagicMock(side_effect=lambda value: value)
+        impl.o_proj = MagicMock(return_value=(torch.ones_like(hidden_states),))
+        impl._submit_sfa_save_operations = MagicMock()
+
+        metadata = self._make_decode_metadata()
+        metadata.layerwise_prefill_callback_metadata = ()
+        metadata.split_boundary = torch.empty(1, dtype=torch.int32)
+        metadata.decode_split_boundary_cpu_tensor = torch.empty_like(metadata.split_boundary)
+        metadata.decode_split_boundary_cpu = metadata.decode_split_boundary_cpu_tensor.numpy()
+        context = SimpleNamespace(
+            dsa_offload_manager=None,
+            dsa_adapter_cache=None,
+            dsa_req_ids=["req-0"],
+            mtp_dw_diag_req_ids={"req-0"},
+        )
+        kv_cache = self._make_eligible_kv_cache()
+
+        # position, prompt length, post-commit, startup/post-commit sample, boundary sample
+        cases = (
+            (27, 24, False, False, False),
+            (28, 24, False, False, True),
+            (31, 24, False, False, True),
+            (32, 24, False, False, True),
+            (33, 24, False, False, True),
+            (36, 24, False, False, True),
+            (37, 24, False, False, False),
+            (40, 40, False, True, False),
+            (41, 40, False, True, False),
+            (42, 40, False, True, False),
+            (43, 40, False, False, False),
+            (40, 24, False, False, False),
+            (40, 24, True, True, False),
+        )
+        for diag_enabled, window in ((False, 0), (False, 16), (True, 0), (True, 16)):
+            for position, prompt_len, post_commit, startup_or_commit, near_boundary in cases:
+                with (
+                    self.subTest(
+                        diag=diag_enabled,
+                        window=window,
+                        position=position,
+                        prompt=prompt_len,
+                        post_commit=post_commit,
+                    ),
+                    patch.object(sfa_v1.envs, "VLLM_ASCEND_MTP_DW_DIAG", diag_enabled),
+                    patch.object(sfa_v1.envs, "VLLM_ASCEND_MTP_DW_DEEP_DIAG", False),
+                    patch.object(sfa_v1, "_decode_window_save_window_size", return_value=window),
+                    patch.object(sfa_v1, "get_forward_context", return_value=context),
+                    patch.object(sfa_v1, "get_weight_prefetch_method", return_value=MagicMock()),
+                    patch.object(sfa_v1, "get_lmcache_sparse_cached_tokens", return_value=[24]),
+                    patch.object(sfa_v1, "wait_for_kv_layer_from_connector") as wait,
+                    patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", False),
+                    patch.object(sfa_v1, "_mtp_dw_event") as event,
+                ):
+                    metadata.decode_split_boundary = None
+                    metadata.seq_lens.fill_(position + 1)
+                    metadata.seq_lens_cpu.fill_(position + 1)
+                    context.dsa_prompt_lens = torch.tensor([prompt_len])
+                    context.mtp_dw_diag_post_commit_req_ids = {"req-0"} if post_commit else None
+                    output = torch.empty_like(hidden_states)
+
+                    result = impl.forward(impl.layer_name, hidden_states, kv_cache, metadata, output=output)
+
+                    self.assertIs(result, output)
+                    self.assertTrue(torch.equal(output, torch.ones_like(output)))
+                    self.assertEqual(len(impl._submit_sfa_save_operations.call_args.args[0]), int(window > 0))
+                    boundary = 16 if window == 16 and position < 32 else 24
+                    self.assertEqual(metadata.decode_split_boundary.tolist(), [boundary])
+                    self.assertIs(impl._prepare_decode_sparse_indices.call_args.args[1], metadata.split_boundary)
+                    self.assertIs(impl._execute_sparse_flash_attention_process.call_args.args[3], remapped)
+                    wait.assert_called_once_with(
+                        impl.layer_name,
+                        selected_tokens=selected,
+                        target_slot_mapping=targets,
+                        request_ids=["req-0"],
+                        selected_token_counts=counts,
+                    )
+                    sample = diag_enabled and (startup_or_commit or (window > 0 and near_boundary))
+                    if sample:
+                        event.assert_called_once()
+                        self.assertEqual(event.call_args.args, ("remap",))
+                        fields = event.call_args.kwargs
+                        self.assertEqual(fields["current_position"], position)
+                        self.assertEqual(fields["window_start"], position // 16 * 16 if window else None)
+                        self.assertEqual(fields["committed_end"], 24)
+                        self.assertEqual(fields["remap_boundary"], boundary)
+                        self.assertEqual(fields["selected_absolute_sample"], [1, 7])
+                    else:
+                        event.assert_not_called()
+
     def test_shared_indexer_reuse_map_prefers_preceding_producer(self):
         # The reuse map is derived from indexer_types; consumers must map to
         # the nearest PRECEDING full producer. logger.info_once deduplicates

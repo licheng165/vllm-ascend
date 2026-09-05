@@ -164,6 +164,156 @@ class TestMTPPlaceholderForwardInputs(unittest.TestCase):
 
         self.assertEqual(runner.input_ids.gpu.tolist(), [11, -1, 33, -1])
 
+    def test_async_real_draft_survives_forward_sanitization(self):
+        runner = self._build_runner()
+        runner.device = torch.device("cpu")
+        runner.pcp_size = 1
+        runner.arange_np = np.arange(4)
+        # Real drafts have been scattered by _prepare_input_ids. The second
+        # request has no previous proposal, so its bootstrap draft remains -1.
+        runner.input_ids.gpu[:] = torch.tensor([11, 42, 33, -1])
+        scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={"req0": [-1], "new": [-1]},
+        )
+        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
+            metadata = runner._calc_spec_decode_metadata(
+                np.array([1, 1]),
+                np.array([2, 4]),
+                None,
+            )
+        runner._sanitize_placeholder_input_ids_for_forward(scheduler_output, 4)
+
+        self.assertEqual(metadata.draft_token_ids.tolist(), [42, -1])
+        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 42, 33, 0])
+        self.assertEqual(scheduler_output.scheduled_spec_decode_tokens["req0"], [-1])
+
+
+class TestMTPAcceptanceDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.runner = NPUModelRunner.__new__(NPUModelRunner)
+        self.runner.speculative_config = SimpleNamespace(method="mtp")
+        self.runner.pcp_size = 1
+        self.runner.use_async_scheduling = True
+        self.runner.requests = {"req0": object()}
+        self.runner.input_batch = SimpleNamespace(
+            req_ids=["req0"],
+            vocab_size=100,
+            sampling_metadata=SimpleNamespace(all_greedy=True),
+        )
+        self.runner.input_ids = SimpleNamespace(gpu=torch.tensor([11, 42]))
+        self.runner.positions = SimpleNamespace(gpu=torch.tensor([131621, 131622]))
+        self.runner.num_discarded_requests = 0
+        self.runner.discard_request_indices = SimpleNamespace(np=np.array([], dtype=np.int32))
+        self.scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={"req0": [-1]})
+        self.metadata = SimpleNamespace(
+            draft_token_ids=torch.tensor([42]),
+            num_draft_tokens=[1],
+            logits_indices=torch.tensor([0, 1]),
+        )
+        self.logits = torch.zeros(2, 100)
+        self.logits[0, 42] = 1
+        self.logits[1, 99] = 1
+        self.output = SimpleNamespace(sampled_token_ids=torch.tensor([[42, 99]]))
+        for patcher in (
+            patch.object(model_runner_module.envs_ascend, "VLLM_ASCEND_MTP_ACCEPT_DIAG", True),
+            patch.object(model_runner_module, "get_tp_group", return_value=SimpleNamespace(rank_in_group=0)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def trace(self):
+        with patch.object(model_runner_module.logger, "info") as log:
+            self.runner._trace_mtp_acceptance(self.scheduler_output, self.metadata, self.logits, self.output)
+        return [call.args[0] % call.args[1:] for call in log.call_args_list]
+
+    def test_reports_device_candidates_not_scheduler_placeholders(self):
+        self.runner._draft_token_ids = torch.tensor([[88]])  # Never read the next proposal.
+        (message,) = self.trace()
+        self.assertIn("draft_ids=[42]", message)
+        self.assertIn("raw_output=[42, 99] accepted=1 worker_placeholder=False", message)
+        self.assertIn("input_ids=[11, 42] positions=[131621, 131622]", message)
+        self.assertIn("raw_target_argmax=[42, 99] logits_nan=False", message)
+        self.assertIn("scheduler_placeholder=True", message)
+
+    def test_reports_rejection_and_actual_bootstrap_placeholder(self):
+        self.output.sampled_token_ids[:] = torch.tensor([[99, -1]])
+        self.metadata.draft_token_ids[:] = -1
+        (message,) = self.trace()
+        self.assertIn("draft_ids=[-1] raw_output=[99, -1] accepted=0 worker_placeholder=True", message)
+
+    def test_disabled_and_other_tp_ranks_do_not_touch_device_tensors(self):
+        self.metadata = self.logits = self.output = object()
+        for enabled, rank in ((False, 0), (True, 1)):
+            with (
+                patch.object(model_runner_module.envs_ascend, "VLLM_ASCEND_MTP_ACCEPT_DIAG", enabled),
+                patch.object(model_runner_module, "get_tp_group", return_value=SimpleNamespace(rank_in_group=rank)),
+                patch.object(torch, "cat", side_effect=AssertionError("unexpected device work")),
+            ):
+                self.assertEqual(self.trace(), [])
+
+    def test_sampling_is_bounded_and_finished_state_is_pruned(self):
+        self.runner._mtp_accept_diag_steps = {"finished": 800, "req0": 3}
+        with patch.object(torch, "cat", side_effect=AssertionError("unexpected device work")):
+            self.assertEqual(self.trace(), [])
+        self.assertNotIn("finished", self.runner._mtp_accept_diag_steps)
+        self.runner._mtp_accept_diag_steps["req0"] = 128
+        self.assertEqual(len(self.trace()), 1)
+        self.runner.num_discarded_requests = 1
+        self.runner.discard_request_indices.np = np.array([0])
+        self.assertEqual(self.trace(), [])
+
+    def test_pcp_layout_is_not_indexed_as_local_inputs(self):
+        self.runner.pcp_size = 2
+        with patch.object(torch, "cat", side_effect=AssertionError("unexpected device work")):
+            self.assertEqual(self.trace(), [])
+
+    def test_request_cap_defers_without_starving_later_rows(self):
+        req_ids = [f"req{i}" for i in range(6)]
+        self.runner.requests = dict.fromkeys(req_ids, object())
+        self.runner.input_batch.req_ids = req_ids
+        self.metadata.num_draft_tokens = [1] * 6
+        self.metadata.draft_token_ids = torch.tensor([42] * 6)
+        self.metadata.logits_indices = torch.arange(12)
+        self.runner.input_ids.gpu = torch.tensor([11, 42] * 6)
+        self.runner.positions.gpu = torch.arange(12)
+        self.logits = torch.zeros(12, 100)
+        self.output.sampled_token_ids = torch.tensor([[42, 99]] * 6)
+        messages = [self.trace() for _ in range(5)]
+        self.assertTrue(all(len(batch) <= 4 for batch in messages))
+        self.assertTrue(any("req=req5 " in message for batch in messages for message in batch))
+
+    def test_reordered_mixed_batch_uses_flat_draft_offsets(self):
+        self.runner.requests = {"req0": object(), "empty": object(), "req2": object()}
+        self.runner.input_batch.req_ids = ["req2", "empty", "req0"]
+        self.metadata.num_draft_tokens = [2, 0, 1]
+        self.metadata.draft_token_ids = torch.tensor([21, 22, 42])
+        self.metadata.logits_indices = torch.tensor([0, 1, 2, 3, 4, 5])
+        self.runner.input_ids.gpu = torch.tensor([10, 21, 22, 9, 11, 42])
+        self.runner.positions.gpu = torch.tensor([10, 11, 12, 7, 20, 21])
+        self.output.sampled_token_ids = torch.tensor([[21, 22, 23], [8, -1, -1], [99, -1, -1]])
+        self.logits = torch.zeros(6, 100)
+        first, second = self.trace()
+        self.assertIn("req=req2", first)
+        self.assertIn("draft_ids=[21, 22] raw_output=[21, 22, 23] accepted=2", first)
+        self.assertIn("req=req0", second)
+        self.assertIn("draft_ids=[42] raw_output=[99, -1, -1] accepted=0", second)
+        self.assertIn("input_ids=[11, 42] positions=[20, 21]", second)
+
+    def test_zero_decode_window_does_not_sample_every_step(self):
+        owner = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                req_id_to_index={"req0": 0},
+                num_computed_tokens_cpu=np.array([131621]),
+            )
+        )
+        output = SimpleNamespace(num_scheduled_tokens={"req0": 2})
+        with (
+            patch.object(model_runner_module, "_mtp_dw_diag_enabled", return_value=True),
+            patch.object(model_runner_module, "_mtp_dw_window_size", return_value=0),
+        ):
+            samples = [model_runner_module._mtp_dw_sample_requests(owner, output) for _ in range(5)]
+        self.assertEqual(samples, [{"req0"}] * 3 + [set(), set()])
+
 
 class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
     def test_short_synthetic_sequences_use_no_remap_sentinel(self):

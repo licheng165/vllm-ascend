@@ -103,6 +103,15 @@ class TestEnvVariables(TestBase):
         with patch.dict(os.environ, {name: "1"}):
             self.assertTrue(getattr(envs_ascend, name))
 
+    def test_mtp_acceptance_diag_is_independent_of_decode_window_diag(self):
+        name = "VLLM_ASCEND_MTP_ACCEPT_DIAG"
+        with patch.dict(os.environ, {"VLLM_ASCEND_MTP_DW_DIAG": "1"}):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "1", "VLLM_ASCEND_MTP_DW_DIAG": "0"}):
+            self.assertTrue(getattr(envs_ascend, name))
+            self.assertFalse(envs_ascend.VLLM_ASCEND_MTP_DW_DIAG)
+
     def test_layerwise_prefill_p_node_uses_strict_boolean_spelling(self):
         name = "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
         with patch.dict(os.environ, {}, clear=False):

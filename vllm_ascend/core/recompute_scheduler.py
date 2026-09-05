@@ -959,8 +959,10 @@ class RecomputeScheduler(Scheduler):
                         scheduler_output.num_invalid_spec_tokens or {}
                     ).get(req_id, 0)
                     logger.info(
-                        "[MTP_ACCEPT] req=%s frontier=%d draft_ids=%s "
-                        "generated_ids=%s accepted=%d invalid=%d placeholder=%s",
+                        # Async scheduling retains CPU placeholders; these are
+                        # not the device candidates used by rejection sampling.
+                        "[MTP_ACCEPT_SCHED] req=%s frontier=%d scheduled_spec_ids=%s "
+                        "generated_ids=%s accepted=%d invalid=%d scheduler_placeholder=%s",
                         req_id,
                         accepted_frontier,
                         list(scheduled_spec_token_ids),

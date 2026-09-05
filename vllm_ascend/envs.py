@@ -282,6 +282,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
     ),
+    # Log actual worker MTP candidates/results (PCP=1) on TP rank 0: first 3
+    # verify steps, then every 128 steps; defer beyond 4 requests/invocation. 0/1,
+    # default off. Independent of DW diagnostics. Sampled records synchronize
+    # a small device payload; token IDs can reveal request/output content.
+    "VLLM_ASCEND_MTP_ACCEPT_DIAG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_ACCEPT_DIAG", "0"))
+    ),
     # Keep this many completed decode-window saves pending before publishing
     # them to the scheduler. The scheduler uses the published frontier for
     # both the next DSA split boundary and saved-block release, so both lag

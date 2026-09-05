@@ -270,7 +270,7 @@ def _mtp_dw_sample_requests(
     if counts is None:
         counts = {}
         owner._mtp_dw_diag_step_counts = counts
-    window_size = max(_mtp_dw_window_size(), 1)
+    window_size = _mtp_dw_window_size()
     sampled: set[str] = set()
     frontiers: dict[str, int] = {}
     for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
@@ -283,8 +283,10 @@ def _mtp_dw_sample_requests(
         frontiers[req_id] = frontier
         step = counts.get(req_id, 0)
         counts[req_id] = step + 1
-        distance = min(frontier % window_size, (-frontier) % window_size)
-        if step < 3 or distance <= 4:
+        near_window = window_size > 0 and min(
+            frontier % window_size, (-frontier) % window_size
+        ) <= 4
+        if step < 3 or near_window:
             sampled.add(req_id)
     owner._mtp_dw_diag_current_frontiers = frontiers
     return sampled
@@ -299,6 +301,8 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_MTP_ACCEPT_DIAG_INTERVAL = 128
+_MTP_ACCEPT_DIAG_MAX_REQUESTS = 4
 _STAGED_SFA_ROUTE_ACTIONS = tuple(StagedSFARouteAction)
 
 
@@ -2590,6 +2594,8 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if envs_ascend.VLLM_ASCEND_MTP_ACCEPT_DIAG:
+            self._trace_mtp_acceptance(scheduler_output, spec_decode_metadata, logits, sampler_output)
         if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
             target_tail_boundary(
                 getattr(self, "_target_sfa_diag_session", None),
@@ -2788,6 +2794,80 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+
+    def _trace_mtp_acceptance(
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        logits: torch.Tensor,
+        sampler_output: SamplerOutput,
+    ) -> None:
+        """Sample actual verification data, not async scheduler placeholders."""
+        if not envs_ascend.VLLM_ASCEND_MTP_ACCEPT_DIAG or get_tp_group().rank_in_group != 0:
+            return
+        counts = getattr(self, "_mtp_accept_diag_steps", {})
+        counts = {req: step for req, step in counts.items() if req in self.requests}
+        self._mtp_accept_diag_steps = counts
+        pending = getattr(self, "_mtp_accept_diag_pending", set()).intersection(self.requests)
+        self._mtp_accept_diag_pending = pending
+        # With PCP, logits indices refer to gathered hidden states, not local
+        # input/position buffers. This diagnostic targets the non-PCP PD path.
+        if spec_decode_metadata is None or self.speculative_config.method != "mtp" or self.pcp_size != 1:
+            return
+
+        discarded = set(self.discard_request_indices.np[:self.num_discarded_requests])
+        draft_start = 0
+        emitted = 0
+        for row, num_drafts in enumerate(spec_decode_metadata.num_draft_tokens):
+            start = draft_start
+            draft_start += num_drafts
+            if not num_drafts or row in discarded:
+                continue
+            req_id = self.input_batch.req_ids[row]
+            step = counts.get(req_id, 0)
+            counts[req_id] = step + 1
+            if step < 3 or step % _MTP_ACCEPT_DIAG_INTERVAL == 0:
+                pending.add(req_id)
+            if req_id not in pending or emitted >= _MTP_ACCEPT_DIAG_MAX_REQUESTS:
+                continue
+            pending.remove(req_id)
+            emitted += 1
+            # Log before the next proposal overwrites _draft_token_ids. Gathers
+            # and one small D2H copy run only on sampled diagnostic steps.
+            width = num_drafts + 1
+            logit_start = start + row
+            input_rows = spec_decode_metadata.logits_indices[logit_start:logit_start + width]
+            verify_logits = logits[logit_start:logit_start + width]
+            output_width = sampler_output.sampled_token_ids.shape[1]
+            payload = torch.cat((
+                spec_decode_metadata.draft_token_ids[start:draft_start].long(),
+                sampler_output.sampled_token_ids[row].long(),
+                self.input_ids.gpu[input_rows].long(),
+                self.positions.gpu[input_rows].long(),
+                verify_logits.argmax(dim=-1).long(),
+                torch.isnan(verify_logits).any().reshape(1).long(),
+            )).detach().cpu().tolist()
+            draft_ids = payload[:num_drafts]
+            offset = num_drafts
+            raw_output = payload[offset:offset + output_width]
+            generated_ids = [token for token in raw_output if 0 <= token < self.input_batch.vocab_size]
+            offset += output_width
+            input_ids = payload[offset:offset + width]
+            positions = payload[offset + width:offset + 2 * width]
+            target_argmax = payload[offset + 2 * width:offset + 3 * width]
+            # Rejection sampling applies penalties/filters to separate logits;
+            # raw argmax alone is not the final acceptance criterion.
+            logger.info(
+                "[MTP_ACCEPT_WORKER] req=%s verify_step=%d async=%s "
+                "draft_ids=%s raw_output=%s accepted=%d worker_placeholder=%s "
+                "input_ids=%s positions=%s raw_target_argmax=%s logits_nan=%s "
+                "all_greedy=%s scheduler_placeholder=%s",
+                req_id, step, self.use_async_scheduling, draft_ids, raw_output,
+                max(len(generated_ids) - 1, 0), PLACEHOLDER_TOKEN_ID in draft_ids,
+                input_ids, positions, target_argmax, bool(payload[-1]),
+                self.input_batch.sampling_metadata.all_greedy,
+                PLACEHOLDER_TOKEN_ID in scheduler_output.scheduled_spec_decode_tokens.get(req_id, []),
+            )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
