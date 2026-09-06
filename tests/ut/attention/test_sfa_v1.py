@@ -1365,35 +1365,37 @@ class TestStagedSFAGraphPoc(TestBase):
         )
 
     @staticmethod
-    def _make_decode_metadata(batch_size: int = 1):
+    def _make_decode_metadata(batch_size: int = 1, query_width: int = 1):
+        num_tokens = batch_size * query_width
+        scratch_capacity = 4 * query_width
         metadata = MagicMock()
-        metadata.attn_state = AscendAttentionState.DecodeOnly
-        metadata.num_input_tokens = batch_size
-        metadata.num_actual_tokens = batch_size
-        metadata.num_decode_tokens = batch_size
-        metadata.cos = torch.ones(batch_size, 2)
-        metadata.sin = torch.zeros(batch_size, 2)
-        metadata.slot_mapping = torch.arange(batch_size)
-        metadata.indexer_slot_mapping = torch.arange(batch_size)
-        metadata.cum_query_lens = torch.arange(1, batch_size + 1)
-        metadata.seq_lens = torch.full((batch_size,), 9)
-        metadata.seq_lens_cpu = torch.full((batch_size,), 9)
+        metadata.attn_state = AscendAttentionState.SpecDecoding if query_width > 1 else AscendAttentionState.DecodeOnly
+        metadata.num_input_tokens = num_tokens
+        metadata.num_actual_tokens = num_tokens
+        metadata.num_decode_tokens = num_tokens
+        metadata.cos = torch.ones(num_tokens, 2)
+        metadata.sin = torch.zeros(num_tokens, 2)
+        metadata.slot_mapping = torch.arange(num_tokens)
+        metadata.indexer_slot_mapping = torch.arange(num_tokens)
+        metadata.cum_query_lens = torch.arange(1, batch_size + 1) * query_width
+        metadata.seq_lens = torch.full((batch_size,), 8 + query_width)
+        metadata.seq_lens_cpu = torch.full((batch_size,), 8 + query_width)
         metadata.block_table = torch.arange(batch_size).view(batch_size, 1)
         metadata.indexer_block_table = torch.arange(batch_size).view(
             batch_size,
             1,
         )
         metadata.prompt_lens = torch.full(
-            (batch_size,),
+            (num_tokens,),
             8,
             dtype=torch.int32,
         )
-        metadata.prompt_lens_cpu_rows = [8] * batch_size
+        metadata.prompt_lens_cpu_rows = [8] * num_tokens
         metadata.decode_req_indices = torch.arange(
             batch_size,
             dtype=torch.int32,
-        )
-        metadata.decode_req_indices_cpu = list(range(batch_size))
+        ).repeat_interleave(query_width)
+        metadata.decode_req_indices_cpu = metadata.decode_req_indices.tolist()
         metadata.decode_req_indices_compact_cpu = np.arange(
             batch_size,
             dtype=np.int64,
@@ -1401,30 +1403,30 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.need_sparse_lmcache_payload = True
         metadata.decode_valid_rows_all = True
         metadata.decode_valid_row_indices = torch.arange(
-            batch_size,
+            num_tokens,
             dtype=torch.int32,
         )
         metadata.decode_scratch_base = torch.zeros(
-            batch_size,
+            num_tokens,
             dtype=torch.int32,
         )
         metadata.decode_scratch_base_compact = None
-        metadata.decode_scratch_base_cpu = [0] * batch_size
-        metadata.decode_scratch_capacity = 4
+        metadata.decode_scratch_base_cpu = [0] * num_tokens
+        metadata.decode_scratch_capacity = scratch_capacity
         metadata.decode_selected_tokens = torch.empty(
-            batch_size, 4, dtype=torch.int32
+            batch_size, scratch_capacity, dtype=torch.int32
         )
         metadata.decode_selected_counts = torch.empty(
             batch_size, 16, dtype=torch.int32
         )
         metadata.decode_target_slot_mapping = torch.empty(
-            batch_size, 4, dtype=torch.long
+            batch_size, scratch_capacity, dtype=torch.long
         )
         metadata.decode_union_mapping_workspace = torch.empty(
-            batch_size, 4, dtype=torch.int32
+            batch_size, scratch_capacity, dtype=torch.int32
         )
         metadata.decode_shard_packed_workspace = torch.empty(
-            batch_size, 2, 4, dtype=torch.int32
+            batch_size, 2, scratch_capacity, dtype=torch.int32
         )
         metadata.decode_shard_mapping_workspace = torch.empty_like(
             metadata.decode_shard_packed_workspace
@@ -1443,7 +1445,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
         metadata.decode_remap_boundary = torch.empty(
-            batch_size,
+            num_tokens,
             dtype=torch.int32,
         )
         metadata.decode_remap_boundary_ready = False
@@ -2512,13 +2514,16 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_indexcache_buffer_roundtrip_helpers(self):
         impl = self._make_eligible_impl()
+        impl.dsa_shrink_latent = 0
         impl.topk_indices_buffer = torch.zeros(8, 4, dtype=torch.int32)
+        impl._indexcache_topk_staging = None
 
         produced = torch.arange(8, dtype=torch.int32).view(8, 1, 1).expand(8, 1, 4)
         impl._update_indexcache_topk_indices(produced.contiguous())
         read_back = impl._get_indexcache_topk_indices(8)
         self.assertEqual(read_back.shape, (8, 1, 4))
         self.assertTrue(torch.equal(read_back, produced))
+        self.assertEqual(read_back.data_ptr(), impl.topk_indices_buffer.data_ptr())
 
         # 2-D buffer rows are unsqueezed to the 3-D kernel layout.
         impl.topk_indices_buffer = torch.zeros(8, 4, dtype=torch.int32)
@@ -2621,6 +2626,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.has_indexer = False
         impl.skip_topk = True
         impl.topk_indices_buffer = torch.tensor([[1, 7, 25, 26]], dtype=torch.int32)
+        impl._indexcache_topk_staging = torch.empty_like(impl.topk_indices_buffer)
         impl.dsa_offload_unbundle = False
         impl.is_kv_producer = False
         impl.enable_dsa_cp_strict_accuracy = False
@@ -3125,6 +3131,270 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         self.assertIsNone(reason)
+
+
+@pytest.mark.parametrize(
+    "shrink_latent,staged,resident",
+    [
+        (0, False, False),
+        (2, False, False),
+        (2, False, True),
+        (2, True, False),
+        (2, True, True),
+    ],
+    ids=["no-shrink", "ordinary-eager", "resident-eager", "ordinary-staged", "resident-staged"],
+)
+@pytest.mark.parametrize("consumer_has_indexer", [False, True], ids=["shared", "runtime-skip"])
+@pytest.mark.parametrize("buffer_ndim", [2, 3])
+@pytest.mark.parametrize("query_width", [1, 2], ids=["q1", "mtp1"])
+def test_indexcache_consumers_preserve_shared_raw_topk(
+    shrink_latent, staged, resident, consumer_has_indexer, buffer_ndim, query_width
+):
+    shared = torch.zeros(4, 4, dtype=torch.int32)
+    if buffer_ndim == 3:
+        shared = shared.unsqueeze(1)
+    hf_config = SimpleNamespace(
+        indexer_types=["full", "shared", "shared"],
+        index_topk=4,
+        index_n_heads=2,
+        index_head_dim=2,
+        model_type="glm_moe_dsa",
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        speculative_config=SimpleNamespace(num_speculative_tokens=1) if query_width == 2 else None,
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config),
+        scheduler_config=SimpleNamespace(max_num_seqs=4 // query_width),
+    )
+    indexer = SimpleNamespace(
+        n_head=2,
+        head_dim=2,
+        topk_tokens=4,
+        wq_b=MagicMock(),
+        wk=MagicMock(),
+        weights_proj=MagicMock(),
+        k_norm=MagicMock(),
+    )
+    layers = []
+    with (
+        patch.object(sfa_v1, "get_current_vllm_config", return_value=config),
+        patch.object(
+            sfa_v1,
+            "get_ascend_config",
+            return_value=SimpleNamespace(
+                enable_shared_expert_dp=False,
+                enable_sparse_c8=False,
+            ),
+        ),
+        patch.object(sfa_v1, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(sfa_v1, "get_tp_group", return_value=SimpleNamespace(rank_in_group=0)),
+        patch.object(sfa_v1, "enable_dsa_cp", return_value=False),
+        patch.object(sfa_v1, "enable_dsa_cp_with_layer_shard", return_value=False),
+        patch.object(sfa_v1, "enable_dsa_cp_with_o_proj_tp", return_value=False),
+        patch.object(sfa_v1, "staged_sfa_graph_configured", return_value=False),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_DSA_UNBUNDLE", True),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_DSA_SHRINK_LATENT", shrink_latent),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_DSA_RESIDENT_CACHE", resident),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_ENABLE_MLAPO", False),
+        # Resident kernels/state are stubbed for the toy top-k width.
+        patch.object(sfa_v1, "INDEX_TOPK", 4),
+        patch.object(sfa_v1, "allocate_sorted_resident_state"),
+        patch.object(sfa_v1, "allocate_sorted_resident_workspace"),
+        patch.object(torch, "empty_like", wraps=torch.empty_like) as allocate_topk,
+    ):
+        for layer_index in range(3):
+            impl = AscendSFAImpl(
+                num_heads=2,
+                head_size=4,
+                scale=1.0,
+                num_kv_heads=1,
+                alibi_slopes=None,
+                sliding_window=None,
+                kv_cache_dtype="auto",
+                logits_soft_cap=None,
+                attn_type="decoder",
+                kv_sharing_target_layer_name=None,
+                q_lora_rank=4,
+                kv_lora_rank=2,
+                qk_nope_head_dim=2,
+                qk_rope_head_dim=2,
+                qk_head_dim=4,
+                v_head_dim=2,
+                rotary_emb=None,
+                q_b_proj=MagicMock(),
+                kv_b_proj=MagicMock(),
+                o_proj=MagicMock(),
+                fused_qkv_a_proj=MagicMock(),
+                q_a_layernorm=MagicMock(),
+                indexer=indexer if layer_index == 0 or consumer_has_indexer else None,
+                skip_topk=layer_index != 0,
+                topk_indices_buffer=shared,
+                layer_name=f"model.layers.{layer_index}.self_attn.attn",
+            )
+            layers.append(impl)
+
+    # Only shrink-enabled consumers allocate private storage, before serving.
+    assert allocate_topk.call_count == (2 if shrink_latent else 0)
+    assert layers[0]._indexcache_topk_staging is None
+    if shrink_latent:
+        staging_ptrs = [impl._indexcache_topk_staging.data_ptr() for impl in layers[1:]]
+        assert len(set([shared.data_ptr(), *staging_ptrs])) == 3
+        for impl in layers[1:]:
+            assert impl._indexcache_topk_staging.shape == shared.shape
+            assert impl._indexcache_topk_staging.dtype == shared.dtype
+            assert impl._indexcache_topk_staging.device == shared.device
+            assert impl._indexcache_topk_staging.is_contiguous()
+    else:
+        assert all(impl._indexcache_topk_staging is None for impl in layers)
+        with patch.object(torch.Tensor, "copy_", side_effect=AssertionError("no-shrink consumer copy")):
+            for rows in (4, 2, 4):
+                for impl in layers[1:]:
+                    assert impl._get_indexcache_topk_indices(rows).data_ptr() == shared.data_ptr()
+
+    hidden = torch.zeros(4, 4)
+    qkv = torch.zeros(4, 8)
+    q = torch.zeros(4, 2, 2)
+    k_li = torch.zeros(4, 1, 2)
+    produced = torch.empty(4, 1, 4, dtype=torch.int32)
+    kv_caches = [TestStagedSFAGraphPoc._make_eligible_kv_cache(num_blocks=8 // query_width) for _ in layers]
+    for impl in layers:
+        assert impl.dsa_shrink_latent == shrink_latent
+        assert impl.dsa_resident_cache == resident
+        assert impl.decode_threshold == query_width
+        impl.fused_qkv_a_proj.side_effect = lambda x: (qkv[: x.shape[0]],)
+        impl.q_a_layernorm.side_effect = lambda x: x
+        impl.exec_kv = MagicMock(return_value=(None, None))
+        impl._q_proj_and_k_up_proj = MagicMock(side_effect=lambda x: (q[: x.shape[0]], q[: x.shape[0]]))
+        impl.rope_single = MagicMock(side_effect=lambda x, cos, sin: x)
+        impl.indexer_select_pre_process = MagicMock(side_effect=lambda **kw: (k_li[: kw["x"].shape[0]], None))
+        impl.indexer_select_post_process = MagicMock(side_effect=AssertionError("consumer ran indexer"))
+        impl._execute_sparse_flash_attention_process = MagicMock(wraps=impl._execute_sparse_flash_attention_process)
+        impl._v_up_proj = MagicMock(side_effect=lambda x: x)
+        impl.o_proj.side_effect = lambda x: (x,)
+        impl._submit_sfa_save_operations = MagicMock()
+
+    # Both NPU planners overwrite their input. Emulate that contract on CPU,
+    # leaving the real producer/consumer paths and planner dispatch intact.
+    def mutate_plan(topk, *args, **kwargs):
+        assert kwargs["mtp" if resident else "staged_mtp"] == query_width
+        assert torch.equal(topk, raw[:rows].unsqueeze(1))
+        metadata.decode_selected_tokens.copy_(topk.view(request_count, 4 * query_width))
+        topk.fill_(layer_index)
+        metadata.decode_selected_counts.fill_(4 * query_width)
+        metadata.decode_target_slot_mapping.fill_(layer_index)
+        return (
+            topk,
+            metadata.decode_selected_tokens,
+            metadata.decode_selected_counts[:, 0],
+            metadata.decode_target_slot_mapping,
+        )
+
+    context = SimpleNamespace(dsa_offload_manager=None, dsa_adapter_cache=None)
+    with (
+        patch.object(sfa_v1, "get_forward_context", return_value=context),
+        patch.object(sfa_v1, "get_weight_prefetch_method", return_value=MagicMock()),
+        patch.object(sfa_v1.torch_npu, "npu_scatter_nd_update_"),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_sparse_flash_attention",
+            side_effect=lambda **kw: hidden[: kw["query"].shape[0]],
+            create=True,
+        ),
+        patch.object(sfa_v1, "_dsa_mask_padding_sparse_rows", side_effect=AssertionError("unexpected padding rewrite")),
+        patch.object(sfa_v1, "_dsa_index_lmcache_enabled", return_value=False),
+        patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),
+        patch.object(sfa_v1, "_decode_window_save_window_size", return_value=0),
+        patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", False),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_MTP_DW_DIAG", False),
+        patch.object(sfa_v1.envs, "VLLM_ASCEND_MTP_DRAFT_DEBUG", False),
+        patch.object(sfa_v1, "prepare_sparse_indices", side_effect=mutate_plan) as ordinary,
+        patch.object(AscendSFAImpl, "_prepare_sorted_resident_sparse_cache", side_effect=mutate_plan) as sorted_plan,
+    ):
+        for step, rows in enumerate((4, 2, 4)):
+            raw = torch.arange(16, dtype=torch.int32).view(4, 4) + 64 + step * 16
+            produced.copy_(raw.unsqueeze(1))
+            layers[0].indexer_select_post_process = MagicMock(return_value=produced[:rows])
+            expected_shared = shared.view(4, 4).clone()
+            expected_shared[:rows].copy_(raw[:rows])
+            request_count = rows // query_width
+            metadata = TestStagedSFAGraphPoc._make_decode_metadata(request_count, query_width=query_width)
+            metadata.seq_lens.fill_(128 + query_width)
+            metadata.seq_lens_cpu.fill_(128 + query_width)
+            metadata.prompt_lens.fill_(128)
+            metadata.prompt_lens_cpu_rows = [128] * rows
+            metadata.block_table = torch.arange(request_count * 2).view(request_count, 2)
+            metadata.indexer_block_table = metadata.block_table
+            metadata.slot_mapping = (
+                metadata.block_table[:, 1:] * 128 + torch.arange(query_width)
+            ).reshape(rows)
+            metadata.indexer_slot_mapping = metadata.slot_mapping
+            metadata.layerwise_prefill_callback_metadata = ()
+            metadata.split_boundary = torch.full((rows,), 128, dtype=torch.int32)
+            metadata.decode_split_boundary = metadata.split_boundary
+            output = torch.empty(rows, 4)
+            plans = []
+            for layer_index, (impl, kv_cache) in enumerate(zip(layers, kv_caches)):
+                if not impl.has_indexer:
+                    kv_cache = kv_cache[:2]
+                with (
+                    patch.object(torch, "empty", side_effect=AssertionError("serving allocation")),
+                    patch.object(torch, "empty_like", side_effect=AssertionError("serving allocation")),
+                    patch.object(torch.Tensor, "clone", side_effect=AssertionError("serving clone")),
+                    patch.object(torch.Tensor, "contiguous", side_effect=AssertionError("contiguous is not isolation")),
+                ):
+                    if staged:
+                        outputs = impl._cross_layer_pre_compute(
+                            hidden[:rows],
+                            kv_cache[0],
+                            kv_cache[1],
+                            kv_cache[2] if impl.has_indexer else None,
+                            metadata.cos,
+                            metadata.sin,
+                            metadata.slot_mapping,
+                            metadata.indexer_slot_mapping,
+                            metadata.cum_query_lens,
+                            metadata.seq_lens,
+                            metadata.indexer_block_table,
+                            metadata.split_boundary,
+                            metadata.decode_req_indices,
+                            metadata.block_table,
+                            metadata.decode_selected_tokens,
+                            metadata.decode_selected_counts,
+                            metadata.decode_target_slot_mapping,
+                            metadata.decode_union_mapping_workspace,
+                            metadata.decode_shard_packed_workspace,
+                            metadata.decode_shard_mapping_workspace,
+                            metadata.decode_shard_counts_workspace,
+                            metadata.resident_state_indices,
+                            metadata.resident_state_generations,
+                        )
+                        plan = outputs[2]
+                    else:
+                        impl.forward(impl.layer_name, hidden[:rows], kv_cache, metadata, output=output)
+                        plan = impl._execute_sparse_flash_attention_process.call_args.args[3]
+                plans.append(plan)
+                assert torch.equal(shared.view(4, 4), expected_shared)
+                if shrink_latent:
+                    assert torch.equal(metadata.decode_selected_tokens, raw[:rows].view(request_count, 4 * query_width))
+                assert plan.shape == (rows, 1, 4)
+                if layer_index:
+                    # Shrink Graph A retains private storage; full-resident
+                    # attention reads the shared address without a planner.
+                    expected_ptr = staging_ptrs[layer_index - 1] if shrink_latent else shared.data_ptr()
+                    assert plan.data_ptr() == expected_ptr
+                for previous_index, previous_plan in enumerate(plans):
+                    if shrink_latent:
+                        assert torch.all(previous_plan == previous_index)
+                    else:
+                        assert torch.equal(previous_plan, raw[:rows].unsqueeze(1))
+            layers[0].indexer_select_post_process.assert_called_once()
+
+    assert ordinary.call_count == (9 if shrink_latent and not resident else 0)
+    assert sorted_plan.call_count == (9 if resident else 0)
+    for impl in layers[1:]:
+        impl.indexer_select_post_process.assert_not_called()
+
 
 class TestAscendSFABackend(TestBase):
     def test_get_name(self):

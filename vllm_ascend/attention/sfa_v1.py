@@ -1944,6 +1944,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={self.decode_threshold}"
             )
+        # Shrink-mode planners rewrite top-k in place. Allocate full-size,
+        # fixed-address consumer staging at startup, including mixed batches.
+        # Without shrink, consumers only read shared raw top-k and need no copy.
+        self._indexcache_topk_staging = (
+            torch.empty_like(self.topk_indices_buffer, memory_format=torch.contiguous_format)
+            if self.skip_topk and self.dsa_shrink_latent and self.topk_indices_buffer is not None
+            else None
+        )
         # Select one startup-static branch so graph replay keeps fixed tensor
         # addresses and never reads an environment variable.
         self.dsa_resident_cache = bool(
@@ -2313,13 +2321,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         return k
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
-        """Read the current batch's top-k from the producer-written buffer."""
+        """Read shared raw top-k, staging a writable copy only for shrink mode."""
         if self.topk_indices_buffer is None:
             raise RuntimeError(
                 "IndexCache requires topk_indices_buffer when skip_topk is "
                 f"enabled. layer_name={self.layer_name}."
             )
-        topk_indices = self.topk_indices_buffer[:num_tokens]
+        if self.dsa_shrink_latent:
+            assert self._indexcache_topk_staging is not None
+            topk_indices = self._indexcache_topk_staging[:num_tokens]
+            topk_indices.copy_(self.topk_indices_buffer[:num_tokens])
+        else:
+            topk_indices = self.topk_indices_buffer[:num_tokens]
         if topk_indices.dim() == 2:
             topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
