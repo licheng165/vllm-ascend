@@ -875,6 +875,8 @@ class NPUModelRunner(GPUModelRunner):
     def _validate_layerwise_prefill_runtime(
         self,
         topology: DSAKVTopology | None = None,
+        *,
+        check_addresses: bool = True,
     ) -> Any:
         if not getattr(self, "layerwise_prefill_p_node", False):
             return None
@@ -888,7 +890,7 @@ class NPUModelRunner(GPUModelRunner):
                 "FULL_DECODE_ONLY graph modes: full-model replay bypasses "
                 "the per-layer transfer-window callbacks."
             )
-        if self.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE:
+        if check_addresses and self.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE:
             self._validate_layerwise_prefill_piecewise_addresses()
         topology = topology or getattr(self, "dsa_kv_topology", None)
         if (
@@ -4779,8 +4781,14 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         if getattr(self, "layerwise_prefill_p_node", False):
+            if getattr(self, "_layerwise_prefill_recorded_addresses", None) is not None:
+                raise RuntimeError(
+                    "Layerwise-prefill KV cache cannot be reinitialized after "
+                    "PIECEWISE addresses were sealed; restart the worker."
+                )
             self._validate_layerwise_prefill_runtime(
-                kv_cache_config.dsa_kv_topology
+                kv_cache_config.dsa_kv_topology,
+                check_addresses=False,
             )
             self._log_layerwise_prefill_startup(kv_cache_config)
         if staged_sfa_graph_configured(self.vllm_config) and getattr(
@@ -4811,6 +4819,13 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        if (
+            getattr(self, "layerwise_prefill_p_node", False)
+            and self.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+        ):
+            # The constructor's one-group batch is temporary. Seal only the
+            # final two-group tables, before any graph capture can use them.
+            self._validate_layerwise_prefill_piecewise_addresses()
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization

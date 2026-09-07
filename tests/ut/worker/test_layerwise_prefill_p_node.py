@@ -589,6 +589,73 @@ def test_piecewise_fixed_addresses_are_stable_across_refresh() -> None:
         runner._validate_layerwise_prefill_piecewise_addresses()
 
 
+def test_piecewise_initialization_seals_final_two_group_batch() -> None:
+    runner = _runner()
+    config = _global_slab_config()
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    runner.cache_config = SimpleNamespace(block_size=1)
+    runner.offload_config = SimpleNamespace(uva=SimpleNamespace(cpu_offload_gb=0))
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32, enable_return_routed_experts=False)
+    runner.max_model_len = runner.max_encoder_len = runner.max_num_tokens = 8
+    runner.max_num_reqs = 2
+    runner.sparse_head_dim = (8, 1)
+    runner.pin_memory = False
+    runner.is_pooling_model = False
+    runner.speculative_config = runner.vllm_config.speculative_config = None
+    runner._profiling_cudagraph_memory = False
+    runner.input_batch = NPUInputBatch(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=32,
+        block_sizes=[1],
+        kernel_block_sizes=[[1]],
+        max_num_blocks_per_req=[8],
+        layerwise_prefill_p_node=True,
+    )
+    temporary_batch = runner.input_batch
+    temporary_addresses = runner._layerwise_prefill_table_addresses()
+    backend = SimpleNamespace(get_supported_kernel_block_sizes=lambda: [1])
+    runner.attn_groups = [
+        [SimpleNamespace(kv_cache_spec=group.kv_cache_spec, backend=backend)] for group in config.kv_cache_groups
+    ]
+    connector = SimpleNamespace(
+        supports_layerwise_prefill_p_node=True,
+        supports_dsa_index_lmcache=True,
+        wait_for_layerwise_prefill_load=lambda _: None,
+        save_layerwise_prefill_kv_layer=lambda *_: None,
+        register_kv_caches=MagicMock(),
+    )
+    with (
+        patch.object(model_runner_module, "has_kv_transfer_group", return_value=True),
+        patch.object(model_runner_module, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(model_runner_module, "get_kv_transfer_group", return_value=connector),
+        patch.object(model_runner_module, "staged_sfa_graph_configured", return_value=False),
+        patch.object(model_runner_module, "get_total_cp_world_size", return_value=1),
+        patch.object(runner, "_log_layerwise_prefill_startup"),
+        patch.object(runner, "_validate_sfa_layerwise_connector_cudagraph_mode"),
+        patch.object(runner, "_validate_and_cache_dsa_kv_topology"),
+        patch.object(runner, "may_add_encoder_only_layers_to_kv_cache_config"),
+        patch.object(runner, "maybe_add_kv_sharing_layers_to_kv_cache_groups"),
+        patch.object(runner, "initialize_attn_backend"),
+        patch.object(runner, "initialize_kv_cache_tensors", return_value={}),
+        patch.object(runner, "_maybe_init_dsa_latent_offload"),
+    ):
+        runner.initialize_kv_cache(config)
+        assert runner.input_batch is not temporary_batch
+        addresses = runner._layerwise_prefill_table_addresses()
+        assert addresses != temporary_addresses
+        assert all(len(bank) == 2 for bank in addresses)
+        assert runner._layerwise_prefill_recorded_addresses == addresses
+        runner._validate_layerwise_prefill_runtime(config.dsa_kv_topology)
+        final_batch = runner.input_batch
+        with pytest.raises(RuntimeError, match="cannot be reinitialized"):
+            runner.initialize_kv_cache(config)
+        assert runner.input_batch is final_batch
+
+
 def test_runtime_rejects_a_consumer_only_connector_role() -> None:
     runner = _runner()
     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
