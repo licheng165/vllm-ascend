@@ -2848,6 +2848,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.positions.gpu[input_rows].long(),
                 verify_logits.argmax(dim=-1).long(),
                 torch.isnan(verify_logits).any().reshape(1).long(),
+                input_rows.long(),
             )).detach().cpu().tolist()
             draft_ids = payload[:num_drafts]
             offset = num_drafts
@@ -2857,18 +2858,21 @@ class NPUModelRunner(GPUModelRunner):
             input_ids = payload[offset:offset + width]
             positions = payload[offset + width:offset + 2 * width]
             target_argmax = payload[offset + 2 * width:offset + 3 * width]
+            logits_indices = payload[offset + 3 * width + 1:]
             # Rejection sampling applies penalties/filters to separate logits;
             # raw argmax alone is not the final acceptance criterion.
             logger.info(
                 "[MTP_ACCEPT_WORKER] req=%s verify_step=%d async=%s "
                 "draft_ids=%s raw_output=%s accepted=%d worker_placeholder=%s "
                 "input_ids=%s positions=%s raw_target_argmax=%s logits_nan=%s "
-                "all_greedy=%s scheduler_placeholder=%s",
+                "all_greedy=%s scheduler_placeholder=%s "
+                "logits_indices=%s num_scheduled_tokens=%d num_drafts=%d",
                 req_id, step, self.use_async_scheduling, draft_ids, raw_output,
                 max(len(generated_ids) - 1, 0), PLACEHOLDER_TOKEN_ID in draft_ids,
-                input_ids, positions, target_argmax, bool(payload[-1]),
+                input_ids, positions, target_argmax, bool(payload[offset + 3 * width]),
                 self.input_batch.sampling_metadata.all_greedy,
                 PLACEHOLDER_TOKEN_ID in scheduler_output.scheduled_spec_decode_tokens.get(req_id, []),
+                logits_indices, scheduler_output.num_scheduled_tokens[req_id], num_drafts,
             )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens

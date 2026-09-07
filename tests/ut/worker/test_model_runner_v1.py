@@ -204,7 +204,10 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
         self.runner.positions = SimpleNamespace(gpu=torch.tensor([131621, 131622]))
         self.runner.num_discarded_requests = 0
         self.runner.discard_request_indices = SimpleNamespace(np=np.array([], dtype=np.int32))
-        self.scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={"req0": [-1]})
+        self.scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={"req0": [-1]},
+            num_scheduled_tokens={"req0": 2},
+        )
         self.metadata = SimpleNamespace(
             draft_token_ids=torch.tensor([42]),
             num_draft_tokens=[1],
@@ -234,15 +237,38 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
         self.assertIn("input_ids=[11, 42] positions=[131621, 131622]", message)
         self.assertIn("raw_target_argmax=[42, 99] logits_nan=False", message)
         self.assertIn("scheduler_placeholder=True", message)
+        self.assertIn("logits_indices=[0, 1] num_scheduled_tokens=2 num_drafts=1", message)
+
+    def test_reports_negative_metadata_indices_without_clamping(self):
+        self.scheduler_output.num_scheduled_tokens["req0"] = 1
+        self.runner.input_ids.gpu = torch.tensor([42, 0])
+        self.runner.positions.gpu = torch.tensor([8386, 0])
+        self.runner.device = torch.device("cpu")
+        self.runner.arange_np = np.arange(2)
+        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
+            self.metadata = self.runner._calc_spec_decode_metadata(
+                np.array([1]), np.array([1]), None,
+            )
+        cpu = MagicMock(wraps=torch.Tensor.cpu)
+        with patch.object(torch.Tensor, "cpu", lambda tensor: cpu(tensor)):
+            (message,) = self.trace()
+        cpu.assert_called_once()
+        self.assertIn("verify_step=0", message)
+        self.assertIn("input_ids=[0, 42] positions=[0, 8386]", message)
+        self.assertIn("logits_nan=False", message)
+        self.assertIn("logits_indices=[-1, 0] num_scheduled_tokens=1 num_drafts=1", message)
+        self.assertEqual(self.metadata.logits_indices.tolist(), [-1, 0])
 
     def test_reports_rejection_and_actual_bootstrap_placeholder(self):
         self.output.sampled_token_ids[:] = torch.tensor([[99, -1]])
         self.metadata.draft_token_ids[:] = -1
+        self.logits[1, 99] = float("nan")
         (message,) = self.trace()
         self.assertIn("draft_ids=[-1] raw_output=[99, -1] accepted=0 worker_placeholder=True", message)
+        self.assertIn("logits_nan=True", message)
 
     def test_disabled_and_other_tp_ranks_do_not_touch_device_tensors(self):
-        self.metadata = self.logits = self.output = object()
+        self.scheduler_output = self.metadata = self.logits = self.output = object()
         for enabled, rank in ((False, 0), (True, 1)):
             with (
                 patch.object(model_runner_module.envs_ascend, "VLLM_ASCEND_MTP_ACCEPT_DIAG", enabled),
@@ -271,6 +297,7 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
         req_ids = [f"req{i}" for i in range(6)]
         self.runner.requests = dict.fromkeys(req_ids, object())
         self.runner.input_batch.req_ids = req_ids
+        self.scheduler_output.num_scheduled_tokens = dict.fromkeys(req_ids, 2)
         self.metadata.num_draft_tokens = [1] * 6
         self.metadata.draft_token_ids = torch.tensor([42] * 6)
         self.metadata.logits_indices = torch.arange(12)
@@ -285,9 +312,10 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
     def test_reordered_mixed_batch_uses_flat_draft_offsets(self):
         self.runner.requests = {"req0": object(), "empty": object(), "req2": object()}
         self.runner.input_batch.req_ids = ["req2", "empty", "req0"]
+        self.scheduler_output.num_scheduled_tokens = {"req0": 2, "empty": 1, "req2": 3}
         self.metadata.num_draft_tokens = [2, 0, 1]
         self.metadata.draft_token_ids = torch.tensor([21, 22, 42])
-        self.metadata.logits_indices = torch.tensor([0, 1, 2, 3, 4, 5])
+        self.metadata.logits_indices = torch.tensor([0, 1, 2, 3, 5, 4])
         self.runner.input_ids.gpu = torch.tensor([10, 21, 22, 9, 11, 42])
         self.runner.positions.gpu = torch.tensor([10, 11, 12, 7, 20, 21])
         self.output.sampled_token_ids = torch.tensor([[21, 22, 23], [8, -1, -1], [99, -1, -1]])
@@ -295,9 +323,11 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
         first, second = self.trace()
         self.assertIn("req=req2", first)
         self.assertIn("draft_ids=[21, 22] raw_output=[21, 22, 23] accepted=2", first)
+        self.assertIn("logits_indices=[0, 1, 2] num_scheduled_tokens=3 num_drafts=2", first)
         self.assertIn("req=req0", second)
         self.assertIn("draft_ids=[42] raw_output=[99, -1, -1] accepted=0", second)
-        self.assertIn("input_ids=[11, 42] positions=[20, 21]", second)
+        self.assertIn("input_ids=[42, 11] positions=[21, 20]", second)
+        self.assertIn("logits_indices=[5, 4] num_scheduled_tokens=2 num_drafts=1", second)
 
     def test_zero_decode_window_does_not_sample_every_step(self):
         owner = SimpleNamespace(
