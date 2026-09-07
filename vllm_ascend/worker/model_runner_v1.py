@@ -1412,6 +1412,18 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        # One non-draft row must precede every request's verification rows.
+        # Check before input scattering; negative indices can otherwise read
+        # stale storage or another request without raising a device error.
+        for req_id, drafts in scheduler_output.scheduled_spec_decode_tokens.items():
+            scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if len(drafts) >= scheduled:
+                raise RuntimeError(
+                    "Invalid speculative schedule: "
+                    f"req={req_id}, scheduled={scheduled}, drafts={len(drafts)}; "
+                    "verification requires a non-draft row"
+                )
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
@@ -1789,6 +1801,16 @@ class NPUModelRunner(GPUModelRunner):
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
         num_sampled_tokens = num_draft_tokens + 1
+        if self.pcp_size == 1:
+            scheduled_per_req = np.diff(cu_num_scheduled_tokens, prepend=0)
+            invalid = (num_draft_tokens < 0) | (num_sampled_tokens > scheduled_per_req)
+            if np.any(invalid):
+                row = int(np.flatnonzero(invalid)[0])
+                raise ValueError(
+                    "Speculative verification exceeds its request's scheduled span: "
+                    f"row={row}, scheduled={scheduled_per_req[row]}, "
+                    f"drafts={num_draft_tokens[row]}"
+                )
         # Step 1. [4, 5, 8, 9, 11]
         cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
         total_num_sampled_tokens = cu_num_sampled_tokens[-1]

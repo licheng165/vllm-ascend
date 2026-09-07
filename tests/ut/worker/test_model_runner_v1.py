@@ -187,6 +187,52 @@ class TestMTPPlaceholderForwardInputs(unittest.TestCase):
         self.assertEqual(runner.input_ids.gpu.tolist(), [11, 42, 33, 0])
         self.assertEqual(scheduler_output.scheduled_spec_decode_tokens["req0"], [-1])
 
+    def test_invalid_verification_width_fails_before_device_preparation(self):
+        for counts, drafts, bad_req in (
+            ({"short": 1}, {"short": [-1]}, "short"),
+            ({"valid": 2, "short": 1}, {"valid": [42], "short": [-1]}, "short"),
+            ({"valid": 2}, {"missing": []}, "missing"),
+        ):
+            with self.subTest(counts=counts, drafts=drafts):
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.input_batch = SimpleNamespace(num_reqs=len(counts))
+                schedule = SimpleNamespace(
+                    total_num_scheduled_tokens=sum(counts.values()),
+                    num_scheduled_tokens=counts,
+                    scheduled_spec_decode_tokens=drafts,
+                )
+                with (
+                    patch.object(runner, "_refresh_layerwise_prefill_block_tables") as refresh,
+                    patch.object(runner, "_prepare_input_ids") as prepare_ids,
+                    self.assertRaisesRegex(RuntimeError, f"Invalid speculative schedule: req={bad_req}"),
+                ):
+                    runner._prepare_inputs(schedule, np.array(list(counts.values())))
+                refresh.assert_not_called()
+                prepare_ids.assert_not_called()
+
+    def test_metadata_rejects_request_local_underflow_before_gather(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.pcp_size = 1
+        for drafts, cumulative, bad_row in (([1], [1], 0), ([1, 1], [2, 3], 1)):
+            with self.subTest(cumulative=cumulative), self.assertRaisesRegex(
+                ValueError, f"scheduled span: row={bad_row}"
+            ):
+                # No input buffer exists: validation must precede any gather.
+                runner._calc_spec_decode_metadata(np.array(drafts), np.array(cumulative), None)
+
+    def test_mixed_prefill_and_verify_rows_stay_in_their_request_spans(self):
+        runner = self._build_runner()
+        runner.device = torch.device("cpu")
+        runner.pcp_size = 1
+        runner.arange_np = np.arange(6)
+        runner.input_ids.gpu = torch.tensor([11, 12, 13, 14, 21, 42])
+        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
+            metadata = runner._calc_spec_decode_metadata(
+                np.array([0, 1]), np.array([4, 6]), None,
+            )
+        self.assertEqual(metadata.logits_indices.tolist(), [3, 4, 5])
+        self.assertEqual(metadata.draft_token_ids.tolist(), [42])
+
 
 class TestMTPAcceptanceDiagnostics(unittest.TestCase):
     def setUp(self):
@@ -243,12 +289,9 @@ class TestMTPAcceptanceDiagnostics(unittest.TestCase):
         self.scheduler_output.num_scheduled_tokens["req0"] = 1
         self.runner.input_ids.gpu = torch.tensor([42, 0])
         self.runner.positions.gpu = torch.tensor([8386, 0])
-        self.runner.device = torch.device("cpu")
-        self.runner.arange_np = np.arange(2)
-        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
-            self.metadata = self.runner._calc_spec_decode_metadata(
-                np.array([1]), np.array([1]), None,
-            )
+        # Simulate corrupt metadata for the diagnostic itself. The real
+        # metadata builder now rejects this layout before a device gather.
+        self.metadata.logits_indices = torch.tensor([-1, 0])
         cpu = MagicMock(wraps=torch.Tensor.cpu)
         with patch.object(torch.Tensor, "cpu", lambda tensor: cpu(tensor)):
             (message,) = self.trace()
