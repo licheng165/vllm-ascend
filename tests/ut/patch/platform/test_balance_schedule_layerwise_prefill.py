@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 from vllm import SamplingParams
 from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.patch.platform.patch_balance_schedule import BalanceScheduler
 
@@ -52,7 +56,8 @@ class _KVCacheManager:
         return [0]
 
 
-def test_balance_scheduler_preserves_prefill_child_generation() -> None:
+@pytest.fixture
+def scheduler() -> BalanceScheduler:
     scheduler = BalanceScheduler.__new__(BalanceScheduler)
     scheduler.max_num_scheduled_tokens = 256
     scheduler.max_num_encoder_input_tokens = 0
@@ -92,7 +97,10 @@ def test_balance_scheduler_preserves_prefill_child_generation() -> None:
         get_freed_mm_hashes=lambda: set(),
     )
     scheduler._update_after_schedule = lambda output: None
+    return scheduler
 
+
+def test_balance_scheduler_preserves_prefill_child_generation(scheduler) -> None:
     request = Request(
         request_id="req-120k",
         prompt_token_ids=list(range(128)),
@@ -113,3 +121,80 @@ def test_balance_scheduler_preserves_prefill_child_generation() -> None:
     assert second.scheduled_cached_reqs.new_block_ids_by_bank == [
         _ChildBlocks.block_ids_by_bank
     ]
+
+
+@pytest.mark.parametrize(
+    ("load_kv_async", "capability", "compact_intent"),
+    [
+        pytest.param(True, True, True, id="cold-full-compact-load"),
+        pytest.param(True, False, False, id="capability-false"),
+        pytest.param(True, None, False, id="capability-absent"),
+        pytest.param(False, True, False, id="no-async-load"),
+        # Feature-off connectors advertise neither compact support nor async load.
+        pytest.param(False, False, False, id="feature-off"),
+    ],
+)
+def test_balance_scheduler_compact_external_load(scheduler, load_kv_async, capability, compact_intent) -> None:
+    scheduler.layerwise_prefill_p_node = False
+    scheduler.num_lookahead_tokens = 8
+    scheduler.kv_cache_manager.blocks = KVCacheBlocks(([KVCacheBlock(block_id=11)],))
+    allocate_slots = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    scheduler.kv_cache_manager.allocate_slots = allocate_slots
+    request = Request(
+        request_id="cold-external",
+        prompt_token_ids=list(range(8192)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    # A full external hit leaves the last prompt token for local computation.
+    external_tokens = request.num_tokens - 1
+    connector = SimpleNamespace(
+        get_num_new_matched_tokens=Mock(return_value=(external_tokens, load_kv_async)),
+        update_state_after_alloc=Mock(),
+        build_connector_meta=Mock(return_value=object()),
+    )
+    if capability is not None:
+        connector.supports_dsa_compact_external_load = capability
+    scheduler.connector = connector
+    scheduler.waiting.add_request(request)
+
+    output = scheduler.schedule()
+
+    connector.get_num_new_matched_tokens.assert_called_once_with(request, 0)
+    allocate_slots.assert_called_once_with(
+        request,
+        0 if load_kv_async else 1,
+        num_new_computed_tokens=0,
+        new_computed_blocks=scheduler.kv_cache_manager.empty_kv_cache_blocks,
+        num_lookahead_tokens=0,
+        num_external_computed_tokens=external_tokens,
+        delay_cache_blocks=load_kv_async,
+        num_encoder_tokens=0,
+        dsa_compact_external_load=compact_intent,
+        allocation_generation=None,
+    )
+    connector.update_state_after_alloc.assert_called_once_with(
+        request, scheduler.kv_cache_manager.blocks, external_tokens
+    )
+    connector.build_connector_meta.assert_called_once_with(output)
+    assert output.kv_connector_metadata is connector.build_connector_meta.return_value
+    assert request.num_external_computed_tokens == external_tokens
+    assert scheduler._request_allocation_generations == {}
+    if load_kv_async:
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert list(scheduler.waiting) == [request]
+        assert scheduler.running == []
+        assert output.scheduled_new_reqs == []
+        assert output.num_scheduled_tokens == {}
+        assert output.total_num_scheduled_tokens == 0
+    else:
+        assert request.status == RequestStatus.RUNNING
+        assert not scheduler.waiting
+        assert scheduler.running == [request]
+        assert request.num_computed_tokens == external_tokens
+        assert output.num_scheduled_tokens == {request.request_id: 1}
+        assert output.total_num_scheduled_tokens == 1
+        new_request = output.scheduled_new_reqs[0]
+        assert new_request.block_ids == scheduler.kv_cache_manager.blocks.get_block_ids()
+        assert new_request.block_ids_by_bank is None
+        assert new_request.allocation_generation is None
