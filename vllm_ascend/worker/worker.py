@@ -85,6 +85,22 @@ def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
     )
 
 
+def _abort_layerwise_prefill_step() -> None:
+    if not has_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if getattr(connector, "supports_layerwise_prefill_transfer_window", False) is not True:
+        return
+    # Drain before serialized MP/uni execution reports the error or reuses KV.
+    # The connector owns the all-TP handshake and handles deferred MTP work.
+    try:
+        connector.abort_layerwise_prefill_step()
+    except ValueError:
+        # A phase mismatch can be reported after the common failed-step drain.
+        # Preserve the model error, but let unknown-fence/fatal errors escape.
+        logger.exception("Layerwise-prefill abort reported a drained step failure; preserving the model error.")
+
+
 class NPUWorker(WorkerBase):
     def __init__(
         self,
@@ -476,7 +492,11 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        except BaseException:
+            _abort_layerwise_prefill_step()
+            raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -508,7 +528,11 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        except BaseException:
+            _abort_layerwise_prefill_step()
+            raise
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

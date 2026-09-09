@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    KVConnectorBase_V1,
     LayerwisePrefillCallbackMetadata,
 )
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
@@ -935,6 +936,15 @@ class NPUModelRunner(GPUModelRunner):
                 "The active KV connector advertises layerwise-prefill P-node "
                 "support without synchronous eager callbacks."
             )
+        if getattr(connector, "supports_layerwise_prefill_transfer_window", False) is True:
+            abort = getattr(connector, "abort_layerwise_prefill_step", None)
+            if not callable(abort) or getattr(abort, "__func__", abort) is getattr(
+                KVConnectorBase_V1, "abort_layerwise_prefill_step", None
+            ):
+                raise RuntimeError(
+                    "The active KV connector advertises a layerwise-prefill "
+                    "transfer window without a concrete abort_layerwise_prefill_step callback."
+                )
         return connector
 
     def _validate_layerwise_prefill_scheduler_output(
@@ -3616,6 +3626,7 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        draft_layer_name = None
         layerwise_request_generations = (
             self.get_layerwise_prefill_request_generations()
             if getattr(self, "layerwise_prefill_p_node", False)
@@ -3703,12 +3714,17 @@ class NPUModelRunner(GPUModelRunner):
                             "Layerwise-prefill attention layer has no canonical "
                             f"execution: {layer_name!r}."
                         )
-                    layer_cm = self._layerwise_prefill_common_attn_metadata(
-                        cm,
-                        execution,
-                        layerwise_request_generations,
-                        _get_block_table_and_slot_mapping,
-                    )
+                    if layer_name == draft_layer_name and spec_decode_common_attn_metadata is not None:
+                        # The backend authenticates these step-local callbacks by
+                        # identity; regular and draft metadata must share them.
+                        layer_cm = copy(spec_decode_common_attn_metadata)
+                    else:
+                        layer_cm = self._layerwise_prefill_common_attn_metadata(
+                            cm,
+                            execution,
+                            layerwise_request_generations,
+                            _get_block_table_and_slot_mapping,
+                        )
                     _build_attn_group_metadata(
                         kv_cache_gid,
                         attn_gid,

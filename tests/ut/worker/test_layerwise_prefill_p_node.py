@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 import math
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
@@ -18,7 +20,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 
+import vllm_ascend.attention.sfa_v1 as sfa_module
+import vllm_ascend.spec_decode.eagle_proposer as proposer_module
 import vllm_ascend.worker.model_runner_v1 as model_runner_module
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.patch.platform.patch_kv_cache_interface import (
     AscendMLAAttentionSpec,
 )
@@ -302,6 +308,194 @@ def test_mtp_draft_common_metadata_uses_execution_78_banks() -> None:
     assert tuple(callback.row.bank for callback in callbacks) == (0, 1)
     assert lowered.indexer_block_table_tensor is tensors[(1, 1)][0]
     assert lowered.indexer_slot_mapping is tensors[(1, 1)][1]
+
+
+@pytest.fixture
+def mtp_metadata_runner(monkeypatch):
+    runner = _runner()
+    runner.kv_cache_config = _global_slab_config()
+    topology = runner.kv_cache_config.dsa_kv_topology
+    runner.dsa_kv_rows_by_layer_name = {row.layer_name: row for rows in topology.rows_by_group for row in rows}
+    runner.dsa_kv_executions_by_ordinal = {execution.execution_ordinal: execution for execution in topology.executions}
+    runner.pcp_size = runner.dcp_size = 1
+    runner._has_gdn = runner.is_mm_prefix_lm = False
+    runner.dsa_two_groups = True
+    runner.dsa_shrink_latent = 0
+    runner.decode_token_per_req = 1
+    runner.need_accepted_tokens = False
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.actual_seq_lengths_q = [2]
+    runner._resident_state_registry = runner._resident_state_indices = runner._resident_state_generations = None
+    runner.model_config = SimpleNamespace(enable_return_routed_experts=False, uses_mrope=False, get_head_size=lambda: 8)
+    runner.vllm_config.model_config = runner.model_config
+    runner.vllm_config.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    for name, values in (("seq_lens", [2, 0]), ("query_start_loc", [0, 2, 2]), ("positions", [0, 1, 0, 0])):
+        cpu = torch.tensor(values, dtype=torch.int32)
+        setattr(runner, name, SimpleNamespace(cpu=cpu, gpu=cpu.clone(), np=cpu.numpy()))
+    runner.input_batch = NPUInputBatch(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=4,
+        device=runner.device,
+        pin_memory=False,
+        vocab_size=32,
+        block_sizes=[1, 1],
+        kernel_block_sizes=[[1], [1]],
+        layerwise_prefill_p_node=True,
+    )
+    runner.input_batch._req_ids = ["request"]
+    runner.input_batch.num_computed_tokens_cpu_tensor.zero_()
+    banks = (([3, 4, 5, 6], [7, 8, 9, 10]), ([13, 14, 15, 16], [17, 18, 19, 20]))
+    runner.requests = {
+        "request": SimpleNamespace(
+            block_ids=banks[0],
+            block_ids_by_bank=banks,
+            block_allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
+            allocation_generation=17,
+        )
+    }
+    for table, blocks in zip(runner.input_batch.layerwise_prefill_block_tables, banks):
+        table.add_row(blocks, 0)
+        table.commit_block_table(1)
+        for group_table in table.block_tables:
+            group_table.compute_slot_mapping(np.array([0, 0]), np.array([0, 1]))
+        table.commit_slot_mapping(2)
+
+    # Run the real SFA builder on CPU, replacing only device/model setup.
+    builder = AscendSFAMetadataBuilder.__new__(AscendSFAMetadataBuilder)
+    builder.metadata_cls = AscendSFAMetadata
+    builder.model_config = runner.model_config
+    builder.dsa_shrink_latent = 0
+    builder.enable_dsa_cp = False
+    builder.scratch_capacity = 4
+    builder.decode_remap_boundary = torch.zeros(4, dtype=torch.int32)
+    builder.attn_mask_builder = SimpleNamespace(get_attention_mask=lambda _: None)
+    monkeypatch.setattr(sfa_module, "get_cos_and_sin_mla", lambda positions, _: (positions, positions))
+    latent_names = runner.kv_cache_config.kv_cache_groups[0].layer_names
+    runner.attn_groups = [[SimpleNamespace(layer_names=latent_names, get_metadata_builder=lambda *_: builder)], []]
+
+    proposer = model_runner_module.AscendEagleProposer.__new__(model_runner_module.AscendEagleProposer)
+    runner.drafter = proposer
+    proposer.runner = runner
+    proposer.vllm_config = runner.vllm_config
+    proposer.method = "mtp"
+    proposer.pcp_size = proposer.dcp_size = 1
+    proposer.uses_mrope = proposer.needs_extra_input_slots = proposer.supports_mm_inputs = False
+    proposer.uses_xdrope_dim = 0
+    proposer.use_staged_mtp_draft_graph = proposer.use_cuda_graph = proposer.parallel_drafting = False
+    proposer.num_speculative_tokens = 3
+    proposer.kernel_block_size = 1
+    proposer.max_model_len = 8
+    proposer.attn_layer_names = ["latent.78"]
+    proposer.draft_attn_groups = [SimpleNamespace(get_metadata_builder=lambda: builder)]
+    proposer.arange = torch.arange(5, dtype=torch.int32)
+    proposer.token_arange_np = proposer.arange.numpy()
+    proposer.input_ids = torch.zeros(4, dtype=torch.int64)
+    proposer.positions = torch.zeros(4, dtype=torch.int32)
+    proposer.hidden_states = torch.zeros((4, 2))
+    proposer.token_indices_to_sample = torch.zeros(2, dtype=torch.int64)
+    proposer.slot_mapping_group = [torch.full((4,), -1, dtype=torch.int32) for _ in range(3)]
+    proposer.indexer_slot_mapping_group = [torch.full((4,), -1, dtype=torch.int32) for _ in range(3)]
+    runner._sync_metadata_across_dp = lambda num_tokens, **_: (num_tokens, None, None)
+    runner.model = object()
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
+    monkeypatch.setattr(proposer_module, "set_ascend_forward_context", lambda *_, **__: nullcontext(context))
+    monkeypatch.setattr(proposer_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(proposer_module, "is_pin_memory_available", lambda: False)
+    monkeypatch.setattr(proposer_module, "HAS_TRITON", False)
+    return runner
+
+
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("prepare", ["first_prefill", "unpadded", "padded"])
+def test_mtp_runner_and_proposer_share_step_local_callback_identity(mtp_metadata_runner, padded, prepare):
+    runner = mtp_metadata_runner
+    proposer = runner.drafter
+    previous_callbacks = None
+    for _ in range(2):
+        with patch.object(
+            model_runner_module.LayerwisePrefillCallbackMetadata,
+            "for_execution",
+            wraps=model_runner_module.LayerwisePrefillCallbackMetadata.for_execution,
+        ) as for_execution:
+            regular, common = runner._build_attention_metadata(
+                num_tokens=2,
+                num_reqs=1,
+                max_query_len=2,
+                num_tokens_padded=4 if padded else 2,
+                num_reqs_padded=2 if padded else 1,
+            )
+
+        callbacks = regular["latent.78"].layerwise_prefill_callback_metadata
+        # Value equality is insufficient: the async backend authenticates `is`.
+        assert common.layerwise_prefill_callback_metadata[0] is callbacks[0]
+        assert common.layerwise_prefill_callback_metadata[1] is callbacks[1]
+        assert common.layerwise_prefill_callback_metadata is callbacks
+        assert [(cb.row.kv_group, cb.row.row_ordinal, cb.row.bank) for cb in callbacks] == [(0, 78, 0), (1, 21, 1)]
+        assert for_execution.call_count == 79
+        assert sorted(args.args[0].execution_ordinal for args in for_execution.call_args_list) == list(range(79))
+        if previous_callbacks is not None:
+            assert callbacks == previous_callbacks
+            assert all(current is not previous for current, previous in zip(callbacks, previous_callbacks))
+        previous_callbacks = callbacks
+        assert len(regular) == 79
+        for execution in runner.kv_cache_config.dsa_kv_topology.executions:
+            metadata = regular[execution.latent.layer_name]
+            rows = metadata.layerwise_prefill_callback_metadata
+            assert rows[0].row is execution.latent
+            if execution.indexer is None:
+                assert len(rows) == 1
+                assert metadata.indexer_block_table is None
+                assert metadata.indexer_slot_mapping is None
+            else:
+                assert len(rows) == 2
+                assert rows[1].row is execution.indexer
+
+        assert common.block_table_tensor[0, :4].tolist() == [3, 4, 5, 6]
+        assert common.indexer_block_table_tensor[0, :4].tolist() == [17, 18, 19, 20]
+        assert common.slot_mapping[:2].tolist() == [3, 4]
+        assert common.indexer_slot_mapping[:2].tolist() == [17, 18]
+        if prepare == "unpadded":
+            common, indices = proposer.prepare_inputs(common, [[11, 12]], [1])
+            assert indices.tolist() == [0, 1]
+        elif prepare == "padded":
+            common, indices, _, _ = proposer.prepare_inputs_padded(
+                common,
+                SimpleNamespace(cu_num_draft_tokens=torch.tensor([1], dtype=torch.int32)),
+                torch.tensor([2], dtype=torch.int32),
+            )
+            assert indices.tolist() == [0, 1]
+        assert common.layerwise_prefill_callback_metadata is callbacks
+
+        proposer._runnable = MagicMock(return_value=torch.tensor([[11, 12, 13]]))
+        with patch.object(proposer, "shallow_copy_metadata", wraps=proposer.shallow_copy_metadata) as shallow_copy:
+            proposer._propose(
+                target_token_ids=torch.tensor([1, 2]),
+                target_positions=torch.tensor([0, 1]),
+                target_hidden_states=torch.zeros((2, 2)),
+                next_token_ids=torch.tensor([11]),
+                token_indices_to_sample=None,
+                common_attn_metadata=common,
+                target_model_batch_desc=None,
+                sampling_metadata=None,
+            )
+        assert shallow_copy.call_count == 2
+        drafts = proposer._runnable.call_args.kwargs["multi_steps_attn_metadata"]
+        assert len(drafts) == 3
+        for step, draft in enumerate(drafts):
+            metadata = draft["latent.78"]
+            assert metadata.layerwise_prefill_callback_metadata is callbacks
+            assert metadata.layerwise_prefill_callback_metadata[0] is callbacks[0]
+            assert metadata.layerwise_prefill_callback_metadata[1] is callbacks[1]
+            assert metadata.slot_mapping.data_ptr() == proposer.slot_mapping_group[step].data_ptr()
+            assert metadata.indexer_slot_mapping.data_ptr() == proposer.indexer_slot_mapping_group[step].data_ptr()
+            assert metadata.block_table[0, :4].tolist() == [3, 4, 5, 6]
+            assert metadata.indexer_block_table[0, :4].tolist() == [17, 18, 19, 20]
+            assert metadata.slot_mapping.tolist() == ([3, 4] if step == 0 else [4 + step, -1])
+            assert metadata.indexer_slot_mapping.tolist() == ([17, 18] if step == 0 else [18 + step, -1])
+        assert proposer.slot_mapping_group[0][:2].tolist() == [3, 4]
+        assert proposer.indexer_slot_mapping_group[0][:2].tolist() == [17, 18]
 
 
 def test_mtp_draft_steps_own_independent_indexer_slot_mappings() -> None:
@@ -684,3 +878,49 @@ def test_feature_off_does_not_query_connector_or_shadow_banks() -> None:
         assert runner._refresh_layerwise_prefill_block_tables() == (primary,)
 
     has_connector.assert_not_called()
+
+
+@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("abort_kind", ["missing", "noncallable", "base_noop", "concrete", "inherited_concrete"])
+def test_runtime_transfer_window_requires_concrete_abort(monkeypatch, window, abort_kind) -> None:
+    runner = _runner()
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+    runner.dsa_kv_topology = _topology()
+
+    def base_abort(self):
+        pass
+
+    def concrete_abort(self):
+        raise AssertionError("runtime validation must not call abort")
+
+    monkeypatch.setattr(
+        model_runner_module.KVConnectorBase_V1, "abort_layerwise_prefill_step", base_abort, raising=False
+    )
+
+    class ParentConnector(SimpleNamespace):
+        if abort_kind == "inherited_concrete":
+            abort_layerwise_prefill_step = concrete_abort
+        elif abort_kind == "base_noop":
+            abort_layerwise_prefill_step = model_runner_module.KVConnectorBase_V1.abort_layerwise_prefill_step
+
+    class Connector(ParentConnector):
+        if abort_kind == "concrete":
+            abort_layerwise_prefill_step = concrete_abort
+        elif abort_kind == "noncallable":
+            abort_layerwise_prefill_step = None
+
+    connector = Connector(
+        supports_layerwise_prefill_p_node=True,
+        supports_layerwise_prefill_transfer_window=window,
+        wait_for_layerwise_prefill_load=lambda _: None,
+        save_layerwise_prefill_kv_layer=lambda *_: None,
+    )
+    monkeypatch.setattr(model_runner_module, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(model_runner_module, "is_v1_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(model_runner_module, "get_kv_transfer_group", lambda: connector)
+
+    if window and abort_kind in ("missing", "noncallable", "base_noop"):
+        with pytest.raises(RuntimeError, match="concrete abort_layerwise_prefill_step"):
+            runner._validate_layerwise_prefill_runtime()
+    else:
+        assert runner._validate_layerwise_prefill_runtime() is connector
