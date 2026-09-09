@@ -120,6 +120,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.attention.target_sfa_diagnostics import (
     target_tail_boundary,
 )
@@ -3576,6 +3577,10 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
+        # Step-local only: positions reuse their storage across forwards, and MTP
+        # builds its own metadata after this call. Never retain these templates.
+        layerwise_sfa_templates: dict[tuple[int, int], AscendSFAMetadata] = {}
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -3598,7 +3603,38 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
-            if for_cudagraph_capture:
+            reuse_layerwise_sfa = (
+                getattr(self, "layerwise_prefill_p_node", False)
+                and kv_cache_gid == 0
+                and layer_names is not None
+                and ubid is None
+                and not for_cudagraph_capture
+                and type(builder) is AscendSFAMetadataBuilder
+                and builder.metadata_cls is AscendSFAMetadata
+                and not builder.dsa_shrink_latent
+                and not builder.enable_dsa_cp
+            )
+            template_key = (kv_cache_gid, attn_gid)
+            if reuse_layerwise_sfa and template_key in layerwise_sfa_templates:
+                # With shrink/CP disabled, SFA build only uses layer-specific
+                # inputs for these five fields. Keep metadata objects (including
+                # mutable readiness flags) independent, and rebind BOTH banks.
+                attn_metadata_i = copy(layerwise_sfa_templates[template_key])
+                cm = common_attn_metadata
+                attn_metadata_i.block_table = cm.block_table_tensor[: cm.num_reqs]
+                attn_metadata_i.slot_mapping = cm.slot_mapping[: cm.num_input_tokens]
+                attn_metadata_i.indexer_block_table = (
+                    cm.indexer_block_table_tensor[: cm.num_reqs]
+                    if cm.indexer_block_table_tensor is not None
+                    else None
+                )
+                attn_metadata_i.indexer_slot_mapping = (
+                    cm.indexer_slot_mapping[: cm.num_input_tokens]
+                    if cm.indexer_block_table_tensor is not None
+                    else None
+                )
+                attn_metadata_i.layerwise_prefill_callback_metadata = cm.layerwise_prefill_callback_metadata
+            elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
                 attn_metadata_i = builder.build(
@@ -3606,6 +3642,8 @@ class NPUModelRunner(GPUModelRunner):
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+                if reuse_layerwise_sfa:
+                    layerwise_sfa_templates[template_key] = attn_metadata_i
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
                 if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() \
