@@ -54,6 +54,17 @@ def _layerwise_protocol_thread_enabled() -> bool:
     )
 
 
+def _layerwise_gc_mode() -> str:
+    raw = os.getenv("VLLM_ASCEND_LAYERWISE_GC_MODE", "default")
+    normalized = raw.strip().lower()
+    if normalized not in ("default", "freeze", "stepwise"):
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_GC_MODE must be 'default', 'freeze' or "
+            f"'stepwise', got {raw!r}"
+        )
+    return normalized
+
+
 def _sparse_decode_d_node_enabled() -> bool:
     raw = os.getenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
     normalized = raw.strip().lower()
@@ -193,6 +204,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # transfer-window backend at construction; 'false' keeps the Plan A inline
     # behavior. Default false. Non-sensitive and fixed for the worker lifetime.
     "VLLM_ASCEND_LAYERWISE_PROTOCOL_THREAD": _layerwise_protocol_thread_enabled,
+    # Plan C for the layerwise prefill P node: worker-process-wide GC policy to
+    # remove the gen2 pause spikes measured behind the step gates. 'freeze':
+    # collect+freeze once at backend construction and widen only the gen2
+    # threshold (700/10/1000) - young cadence and cycle reclamation unchanged.
+    # 'stepwise': disable GC and run one bounded gen0 collection after each
+    # step's commit gate (experiment mode; promoted cycles are not reclaimed).
+    # 'default' changes nothing. Read by LMCache-Ascend's P backends at
+    # construction. Default default. Non-sensitive, fixed for the worker
+    # lifetime; rollback is the default value plus a worker restart.
+    "VLLM_ASCEND_LAYERWISE_GC_MODE": _layerwise_gc_mode,
     # Run the DSA decoder in sparse-managed mode: full INDEXER resident, only
     # compact-scratch LATENT on NPU, historical LATENT retrieved per layer
     # from LMCache. Mutually exclusive with
